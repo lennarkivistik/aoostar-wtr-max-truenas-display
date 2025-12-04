@@ -1,5 +1,7 @@
 # WTR Display - TrueNAS Network Monitor
 
+[Display Data](screenshot.png)
+
 A Go application to display TrueNAS system statistics on the WTR MAX / AOOSTAR front panel LCD display.
 
 > **Note**: This project is specifically built for **TrueNAS SCALE** running on AOOSTAR WTR MAX hardware. It's tailored to my personal use case. If you need different features or want to adapt it for other systems, please fork this repository.
