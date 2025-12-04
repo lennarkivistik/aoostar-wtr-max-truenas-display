@@ -1,0 +1,24 @@
+# Build artifacts
+wtr-display
+wtr-display-*
+build/
+*.exe
+*.o
+*.a
+
+# OS specific
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Go
+go.work
+
