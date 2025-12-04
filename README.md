@@ -1,6 +1,6 @@
 # WTR Display - TrueNAS Network Monitor
 
-[Display Data](screenshot.png)
+![Display Data](screenshot.png)
 
 A Go application to display TrueNAS system statistics on the WTR MAX / AOOSTAR front panel LCD display.
 
@@ -244,4 +244,4 @@ The display uses a proprietary protocol over USB serial:
 
 ## License
 
-Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
+Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
