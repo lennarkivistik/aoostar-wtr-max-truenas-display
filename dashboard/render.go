@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"strings"
 
 	"go-wtr-display/display"
 	"go-wtr-display/network"
@@ -131,33 +132,22 @@ func renderSpeeds(img *image.RGBA, renderer *display.TextRenderer, state *State)
 		rxPoints, txPoints := state.WaveAnimator.GetWavePoints(waveHeight)
 		waveWidth, _ := state.WaveAnimator.GetConfig()
 
-		// Convert wave.Point to display.WavePoint
-		rxWavePoints := make([]display.WavePoint, len(rxPoints))
-		txWavePoints := make([]display.WavePoint, len(txPoints))
-
-		for i, p := range rxPoints {
-			rxWavePoints[i] = display.WavePoint{X: p.X, Y: p.Y}
-		}
-		for i, p := range txPoints {
-			txWavePoints[i] = display.WavePoint{X: p.X, Y: p.Y}
-		}
-
 		// Draw RX wave (Teal) - download
-		if len(rxWavePoints) >= 2 {
+		if len(rxPoints) >= 2 {
 			display.DrawTimestampedWave(img, waveY-waveHeight, waveHeight,
-				waveWidth, rxWavePoints, colorTeal, colorTealFill)
+				waveWidth, rxPoints, colorTeal, colorTealFill)
 		}
 
 		// Draw TX wave (Blue) - upload (on top with transparency)
-		if len(txWavePoints) >= 2 {
+		if len(txPoints) >= 2 {
 			display.DrawTimestampedWave(img, waveY-waveHeight, waveHeight,
-				waveWidth, txWavePoints, colorBlue, colorBlueFill)
+				waveWidth, txPoints, colorBlue, colorBlueFill)
 		}
 	}
 
 	// Draw Speed Text on top (uses averaged values for stability)
-	rxSpeed := formatSpeedParts(state.DisplayRxSpeed)
-	txSpeed := formatSpeedParts(state.DisplayTxSpeed)
+	rxSpeed := formatSpeedParts(state.DisplayRxSpeed, &state.LastRxUnit)
+	txSpeed := formatSpeedParts(state.DisplayTxSpeed, &state.LastTxUnit)
 
 	// Left side: Download
 	drawSpeedDisplay(img, renderer, 80, centerY-20, "▼", rxSpeed, colorTeal)
@@ -171,23 +161,57 @@ type speedParts struct {
 	Unit  string
 }
 
-func formatSpeedParts(bytesPerSec float64) speedParts {
+// formatSpeedParts formats a speed value with hysteresis to prevent unit
+// flicker at boundaries. Once a unit is entered, the value must drop below
+// 80% of the boundary to switch back down (or rise above the boundary to go up).
+func formatSpeedParts(bytesPerSec float64, lastUnit *string) speedParts {
 	bitsPerSec := bytesPerSec * 8
 	const (
-		Kbps = 1000
-		Mbps = Kbps * 1000
-		Gbps = Mbps * 1000
+		Kbps       = 1000
+		Mbps       = Kbps * 1000
+		Gbps       = Mbps * 1000
+		hysteresis = 0.8
 	)
 
+	unit := "b/s"
 	switch {
 	case bitsPerSec >= Gbps:
-		return speedParts{fmt.Sprintf("%.2f", bitsPerSec/Gbps), "Gb/s"}
+		unit = "Gb/s"
 	case bitsPerSec >= Mbps:
-		return speedParts{fmt.Sprintf("%.1f", bitsPerSec/Mbps), "Mb/s"}
+		unit = "Mb/s"
 	case bitsPerSec >= Kbps:
-		return speedParts{fmt.Sprintf("%.0f", bitsPerSec/Kbps), "Kb/s"}
+		unit = "Kb/s"
+	}
+
+	// Apply hysteresis: if the previous unit was higher, stay there until
+	// the value drops decisively below the threshold.
+	if *lastUnit != "" && *lastUnit != unit {
+		switch *lastUnit {
+		case "Gb/s":
+			if bitsPerSec >= float64(Gbps)*hysteresis {
+				unit = "Gb/s"
+			}
+		case "Mb/s":
+			if unit == "Kb/s" && bitsPerSec >= float64(Mbps)*hysteresis {
+				unit = "Mb/s"
+			}
+		case "Kb/s":
+			if unit == "b/s" && bitsPerSec >= float64(Kbps)*hysteresis {
+				unit = "Kb/s"
+			}
+		}
+	}
+	*lastUnit = unit
+
+	switch unit {
+	case "Gb/s":
+		return speedParts{fmt.Sprintf("%.2f", bitsPerSec/Gbps), unit}
+	case "Mb/s":
+		return speedParts{fmt.Sprintf("%.1f", bitsPerSec/Mbps), unit}
+	case "Kb/s":
+		return speedParts{fmt.Sprintf("%.0f", bitsPerSec/Kbps), unit}
 	default:
-		return speedParts{fmt.Sprintf("%.0f", bitsPerSec), "b/s"}
+		return speedParts{fmt.Sprintf("%.0f", bitsPerSec), unit}
 	}
 }
 
@@ -204,53 +228,96 @@ func drawSpeedDisplay(img *image.RGBA, renderer *display.TextRenderer, x, center
 	renderer.DrawText(img, valueX+valueWidth+12, centerY-20, speed.Unit, accentColor, 40, false)
 }
 
+// gaugeConfig holds sizing parameters for the dynamic gauge layout.
+// Selected based on how many items need to be displayed.
+type gaugeConfig struct {
+	radius        int
+	thickness     int
+	percentFont   float64
+	labelFont     float64
+	labelMaxChars int
+}
+
 func renderStatsTiles(img *image.RGBA, renderer *display.TextRenderer, state *State) {
 	baseY := headerHeight + speedsHeight
 	tileY := baseY + 5
 
-	// Gauge parameters
-	gaugeRadius := 35
-	gaugeThickness := 9
+	type gaugeTile struct {
+		percent float64
+		label   string
+	}
 
-	// Calculate tile positions
-	positions := []int{120, 340, 560, 780}
-
-	// Tile 1: CPU
-	drawGaugeTile(img, renderer, positions[0], tileY, gaugeRadius, gaugeThickness,
-		state.DisplayCPU, "CPU")
-
-	// Tile 2: RAM
 	memPercent := 0.0
 	if state.Memory != nil {
 		memPercent = state.Memory.UsedPercent
 	}
-	drawGaugeTile(img, renderer, positions[1], tileY, gaugeRadius, gaugeThickness,
-		memPercent, "RAM")
 
-	// Tiles 3-4: Pools
-	for i := 0; i < 2 && i < len(state.Pools); i++ {
-		pool := state.Pools[i]
-		label := pool.Name
-		if len(label) > 7 {
-			label = label[:7]
+	items := []gaugeTile{
+		{state.DisplayCPU, "CPU"},
+		{memPercent, "RAM"},
+	}
+
+	for _, pool := range state.Pools {
+		if strings.HasPrefix(pool.Name, "boot") {
+			continue
 		}
-		drawGaugeTile(img, renderer, positions[2+i], tileY, gaugeRadius, gaugeThickness,
-			pool.UsedPercent, label)
+		items = append(items, gaugeTile{pool.UsedPercent, pool.Name})
+	}
+
+	if len(items) > 6 {
+		items = items[:6]
+	}
+
+	count := len(items)
+	if count == 0 {
+		return
+	}
+
+	var cfg gaugeConfig
+	if count <= 4 {
+		cfg = gaugeConfig{
+			radius:        44,
+			thickness:     16,
+			percentFont:   36,
+			labelFont:     22,
+			labelMaxChars: 10,
+		}
+	} else {
+		cfg = gaugeConfig{
+			radius:        38,
+			thickness:     14,
+			percentFont:   32,
+			labelFont:     20,
+			labelMaxChars: 8,
+		}
+	}
+
+	cellWidth := display.Width / count
+	for i, item := range items {
+		cx := cellWidth/2 + i*cellWidth
+
+		label := item.label
+		if len(label) > cfg.labelMaxChars {
+			label = label[:cfg.labelMaxChars]
+		}
+
+		drawGaugeTile(img, renderer, cx, tileY, item.percent, label, cfg)
 	}
 }
 
-func drawGaugeTile(img *image.RGBA, renderer *display.TextRenderer, cx, y, radius, thickness int, percent float64, label string) {
-	cy := y + radius
+func drawGaugeTile(img *image.RGBA, renderer *display.TextRenderer, cx, y int, percent float64, label string, cfg gaugeConfig) {
+	cy := y + cfg.radius
 	gaugeColor := getUsageColor(percent)
 
-	display.DrawArcGaugeSimple(img, cx, cy, radius, thickness, percent, gaugeColor, colorGaugeBg)
+	display.DrawArcGaugeSimple(img, cx, cy, cfg.radius, cfg.thickness, percent, gaugeColor, colorGaugeBg)
 
 	percentText := fmt.Sprintf("%.0f", percent)
-	textWidth := renderer.MeasureText(percentText, 32, true)
-	renderer.DrawText(img, cx-textWidth/2, cy+10, percentText, colorWhite, 32, true)
+	textWidth := renderer.MeasureText(percentText, cfg.percentFont, true)
+	renderer.DrawText(img, cx-textWidth/2, cy+int(cfg.percentFont/3), percentText, colorWhite, cfg.percentFont, true)
 
-	labelWidth := renderer.MeasureText(label, 24, false)
-	renderer.DrawText(img, cx-labelWidth/2, cy+radius+22, label, colorBrightGray, 24, false)
+	labelY := cy + int(float64(cfg.radius)*0.75) + 16
+	labelWidth := renderer.MeasureText(label, cfg.labelFont, false)
+	renderer.DrawText(img, cx-labelWidth/2, labelY, label, colorBrightGray, cfg.labelFont, false)
 }
 
 func getUsageColor(percent float64) color.Color {

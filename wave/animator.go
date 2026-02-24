@@ -4,6 +4,7 @@
 package wave
 
 import (
+	"go-wtr-display/display"
 	"sync"
 	"time"
 )
@@ -99,7 +100,7 @@ func (a *Animator) pruneOldSamples() {
 // Auto-scales to visible data so small variations fill the wave height.
 // Includes off-screen points for smooth edge rendering.
 // OPTIMIZED: Avoids intermediate allocations by doing two passes over samples.
-func (a *Animator) GetWavePoints(screenHeight int) ([]Point, []Point) {
+func (a *Animator) GetWavePoints(screenHeight int) ([]display.WavePoint, []display.WavePoint) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -195,8 +196,8 @@ func (a *Animator) GetWavePoints(screenHeight int) ([]Point, []Point) {
 	maxVal := a.smoothedMax
 
 	// Second pass: generate points directly into result slices
-	rxPoints := make([]Point, 0, count)
-	txPoints := make([]Point, 0, count)
+	rxPoints := make([]display.WavePoint, 0, count)
+	txPoints := make([]display.WavePoint, 0, count)
 
 	// Optimization: iterate only the relevant range if we tracked it correctly
 	// But simple iteration is fast enough for <20 items
@@ -216,18 +217,12 @@ func (a *Animator) GetWavePoints(screenHeight int) ([]Point, []Point) {
 				txY = 1.0
 			}
 
-			rxPoints = append(rxPoints, Point{X: x, Y: rxY})
-			txPoints = append(txPoints, Point{X: x, Y: txY})
+			rxPoints = append(rxPoints, display.WavePoint{X: x, Y: rxY})
+			txPoints = append(txPoints, display.WavePoint{X: x, Y: txY})
 		}
 	}
 
 	return rxPoints, txPoints
-}
-
-// Point represents a normalized data point
-type Point struct {
-	X float64 // Pixel X coordinate
-	Y float64 // Normalized value 0.0-1.0
 }
 
 // IsAnimating always returns true for continuous animation.

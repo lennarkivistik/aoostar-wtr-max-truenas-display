@@ -49,6 +49,10 @@ type State struct {
 	DisplayTxSpeed float64
 	DisplayCPU     float64
 
+	// Hysteresis tracking for speed unit display (prevents flicker at boundaries)
+	LastRxUnit string
+	LastTxUnit string
+
 	// For rolling average calculation
 	RecentRx []float64
 	RecentTx []float64
@@ -187,12 +191,15 @@ func (s *State) ClearExpiredNotification() {
 	}
 }
 
-// SetLastFrame stores the last rendered frame for screenshot capture.
-// Thread-safe for concurrent access from the socket server.
+// SetLastFrame stores a copy of the rendered frame for screenshot capture.
+// Copies the pixel data so the caller can safely reuse the source buffer.
 func (s *State) SetLastFrame(img *image.RGBA) {
 	s.frameMutex.Lock()
 	defer s.frameMutex.Unlock()
-	s.lastFrame = img
+	if s.lastFrame == nil || s.lastFrame.Bounds() != img.Bounds() {
+		s.lastFrame = image.NewRGBA(img.Bounds())
+	}
+	copy(s.lastFrame.Pix, img.Pix)
 }
 
 // GetLastFrame returns a copy of the last rendered frame.
@@ -205,13 +212,8 @@ func (s *State) GetLastFrame() *image.RGBA {
 		return nil
 	}
 
-	// Return a copy to avoid race conditions
 	bounds := s.lastFrame.Bounds()
-	copy := image.NewRGBA(bounds)
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			copy.Set(x, y, s.lastFrame.At(x, y))
-		}
-	}
-	return copy
+	cp := image.NewRGBA(bounds)
+	copy(cp.Pix, s.lastFrame.Pix)
+	return cp
 }

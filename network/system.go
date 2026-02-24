@@ -273,15 +273,21 @@ func FormatDuration(seconds int64) string {
 	return strconv.FormatInt(minutes, 10) + "m"
 }
 
-// GetLoggedInUsers returns a list of currently logged-in users.
-// Uses the 'who' command which is lightweight and standard on Linux.
+// GetLoggedInUsers returns a list of currently logged-in users by reading
+// /var/run/utmp directly, avoiding a process spawn every call.
+// On Linux x86_64, each utmp record is 384 bytes; ut_type (int16) is at
+// offset 0 and ut_user (char[32]) is at offset 44. USER_PROCESS = 7.
 // Returns empty slice if no users are logged in or on error.
 func GetLoggedInUsers() []string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	const (
+		utmpPath    = "/var/run/utmp"
+		recordSize  = 384
+		userProcess = 7
+		userOffset  = 44
+		userLen     = 32
+	)
 
-	cmd := exec.CommandContext(ctx, "who")
-	output, err := cmd.Output()
+	data, err := os.ReadFile(utmpPath)
 	if err != nil {
 		return nil
 	}
@@ -289,18 +295,24 @@ func GetLoggedInUsers() []string {
 	var users []string
 	seen := make(map[string]bool)
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	for _, line := range lines {
-		if line == "" {
+	for i := 0; i+recordSize <= len(data); i += recordSize {
+		rec := data[i : i+recordSize]
+
+		utType := int16(rec[0]) | int16(rec[1])<<8
+		if utType != userProcess {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) >= 1 {
-			user := fields[0]
-			if !seen[user] {
-				seen[user] = true
-				users = append(users, user)
-			}
+
+		raw := rec[userOffset : userOffset+userLen]
+		n := 0
+		for n < len(raw) && raw[n] != 0 {
+			n++
+		}
+		user := string(raw[:n])
+
+		if user != "" && !seen[user] {
+			seen[user] = true
+			users = append(users, user)
 		}
 	}
 

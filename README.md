@@ -1,6 +1,6 @@
 # WTR Display - TrueNAS Network Monitor
 
-![Display Data](screenshot.png)
+![Display Data](docs/screenshot.png)
 
 A Go application to display TrueNAS system statistics on the WTR MAX / AOOSTAR front panel LCD display.
 
@@ -16,7 +16,7 @@ This project was made possible thanks to [zehnm/aoostar-rs](https://github.com/z
 - **System Information**: TrueNAS version, IP address, interface name, link speed, uptime
 - **CPU Usage**: Live CPU utilization with color-coded arc gauge
 - **Memory Usage**: RAM utilization percentage with arc gauge
-- **ZFS Pool Status**: Auto-discovers pools, shows usage with color-coded gauges
+- **ZFS Pool Status**: Auto-discovers pools (boot pools filtered), dynamic gauge sizing for 2-6 items
 - **Notifications**: External scripts can send notifications to the display
 - **Screenshots**: Capture current display to PNG file
 - **Login Indicator**: Red dot shows when users are logged into shell
@@ -33,23 +33,71 @@ This project was made possible thanks to [zehnm/aoostar-rs](https://github.com/z
 
 ## Installation
 
+### Install on TrueNAS SCALE (Recommended)
+
+Download the latest release binary and set it up to start automatically on boot.
+
+#### 1. Download the binary
+
+SSH into your TrueNAS box and download the latest release to a persistent dataset:
+
+```bash
+mkdir -p /mnt/tank/apps/wtr-display
+cd /mnt/tank/apps/wtr-display
+
+# Download the latest release (replace version as needed)
+wget https://github.com/lennarkivistik/aoostar-wtr-max-truenas-display/releases/download/v1.0.1/wtr-display-linux-amd64-v1.0.1
+chmod +x wtr-display-linux-amd64-v1.0.1
+```
+
+> Replace `/mnt/tank/` with your own pool/dataset path. The binary must live on a dataset so it survives reboots and updates.
+
+#### 2. Create a start script
+
+Create `/mnt/tank/apps/wtr-display/start.sh`:
+
+```bash
+#!/bin/sh
+exec /mnt/tank/apps/wtr-display/wtr-display-linux-amd64-v1.0.1 --iface enp101s0 --auto >/dev/null 2>&1
+```
+
+Then make it executable:
+
+```bash
+chmod +x /mnt/tank/apps/wtr-display/start.sh
+```
+
+> Adjust `--iface` to your network interface. Run `./wtr-display-linux-amd64-v1.0.1 --list-ifaces` to see available interfaces. Don't background the process with `&` -- `exec` replaces the shell cleanly.
+
+#### 3. Add as Init Script in TrueNAS UI
+
+1. Go to **System Settings > Advanced > Init/Shutdown Scripts > Add**
+2. Configure:
+   - **Type**: Script
+   - **Script**: `/mnt/tank/apps/wtr-display/start.sh`
+   - **When**: Post Init
+   - **Enabled**: Yes
+   - **Timeout**: 10 seconds
+
+The display will now start automatically on every boot after networking is up.
+
 ### Build from Source
 
 ```bash
 # Build for Linux x86_64 (TrueNAS)
-./build.sh linux amd64 v0.5.0
+./build.sh linux amd64 v1.0.1
 
-# Output: build/linux-amd64/wtr-display-linux-amd64-v0.5.0
+# Output: build/linux-amd64/wtr-display-linux-amd64-v1.0.1
 ```
 
-### Deploy to TrueNAS
+### Deploy Manually
 
 ```bash
 # Copy binary to TrueNAS
-scp build/linux-amd64/wtr-display-linux-amd64-v0.5.0 root@truenas:/path/to/destination/
+scp build/linux-amd64/wtr-display-linux-amd64-v1.0.1 root@truenas:/mnt/tank/apps/wtr-display/
 
 # On TrueNAS, make executable
-chmod +x wtr-display-linux-amd64-v0.5.0
+chmod +x wtr-display-linux-amd64-v1.0.1
 ```
 
 ## Usage
@@ -140,108 +188,17 @@ Capture the current display to a PNG file:
 | `--notify-duration` | Notification duration in seconds (0=persistent) | 10 |
 | `--screenshot` | Save screenshot from running display (PNG) | - |
 
-## Display Layout
+## Documentation
 
-```
-+------------------------------------------------------------------------------+
-| TrueNAS SCALE 24.10.0          192.168.1.100          eth0 10G  *  5d 12h    |
-|------------------------------------------------------------------------------|
-|                                                                              |
-|      [wave visualization]                    [wave visualization]            |
-|                                                                              |
-|      V  452.3        Mb/s                    ^  234.1        Mb/s            |
-|                                                                              |
-|------------------------------------------------------------------------------|
-|       (78)           (62)           (45)           (12)                      |
-|        CPU            RAM          fastpool        tank                      |
-+------------------------------------------------------------------------------+
-|  *  <- Red dot when user logged in
-```
-
-### Notification Box (overlays center)
-```
-              +---------------------------+
-              |   Scrub: tank 45.2%       |  <- Yellow (warning)
-              +---------------------------+
-
-              +---------------------------+
-              |   DEGRADED: tank          |  <- Red (danger)
-              +---------------------------+
-```
-
-### Color Coding
-
-- **Download**: Teal/Cyan
-- **Upload**: Blue
-- **Gauges** (CPU/RAM/Pools):
-  - Green: < 75%
-  - Yellow: 75-90%
-  - Red: > 90%
-- **Notifications**:
-  - Info: White background, black text
-  - Warning: Yellow background, black text
-  - Danger: Red background, white text
-- **Login Indicator**: Bright red dot (bottom-left)
-
-## Architecture
-
-```
-go-wtr-display/
-├── main.go                 # CLI entry point and main loop
-├── display/
-│   ├── display.go          # Serial port communication and protocol
-│   ├── image.go            # RGB565 conversion and image transmission
-│   ├── text.go             # Font rendering with Go fonts
-│   ├── shapes.go           # Rectangles, circles, rounded rects
-│   ├── gauge.go            # Arc gauge rendering
-│   └── wave.go             # Wave/sparkline visualization
-├── dashboard/
-│   ├── state.go            # Dashboard state and notification types
-│   ├── render.go           # UI rendering functions
-│   ├── scheduler.go        # Night mode scheduling
-│   ├── auto.go             # Auto FPS calculation
-│   └── notify.go           # Unix socket notification server
-├── network/
-│   ├── stats.go            # Network throughput monitoring
-│   ├── history.go          # Network stats history
-│   └── system.go           # CPU, memory, ZFS, login detection
-├── wave/
-│   └── animator.go         # Wave animation state machine
-└── build.sh                # Cross-compilation script
-```
-
-## Data Sources
-
-All data is gathered non-invasively:
-
-| Data | Source | Interval | Impact |
-|------|--------|----------|--------|
-| CPU Usage | `/proc/stat` | 1s | None (file read) |
-| Memory | `/proc/meminfo` | 5s | None (file read) |
-| Network Stats | `/sys/class/net/<iface>/statistics/` | 1s | None (file read) |
-| ZFS Pools | `zpool list` command | 5s | Minimal (~10ms) |
-| ZFS Status | `zpool status` command | 60s | Minimal (~20ms) |
-| Logged-in Users | `who` command | 10s | Minimal (~5ms) |
-| TrueNAS Version | `/etc/version` or `/etc/os-release` | Once | None (file read) |
-| IP Address | Go `net` package | 30s | None (syscall) |
-| Link Speed | `/sys/class/net/<iface>/speed` | 30s | None (file read) |
-| Uptime | `/proc/uptime` | 30s | None (file read) |
-
-## Protocol Details
-
-The display uses a proprietary protocol over USB serial:
-
-- **Baud Rate**: 1,500,000 (ignored, USB bulk transfer)
-- **Display On**: `AA 55 AA 55 0B 00 00 00`
-- **Display Off**: `AA 55 AA 55 0A 00 00 00`
-- **Image Format**: RGB565, sent in 47-byte chunks with offset headers
+- [Design Concepts](docs/DESIGN.md) -- display layout, color coding, gauge design
+- [Development Guide](docs/DEVELOPMENT.md) -- architecture, data sources, protocol details, coding conventions
 
 ## Requirements
 
-- Go 1.21+ (for building)
 - Linux system with ZFS (for pool monitoring)
 - WTR MAX / AOOSTAR device with front panel display
+- Go 1.24+ (only for building from source)
 
 ## License
 
-Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+[Apache License, Version 2.0](LICENSE)

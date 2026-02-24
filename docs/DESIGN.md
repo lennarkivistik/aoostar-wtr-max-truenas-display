@@ -198,3 +198,53 @@ Each gauge is a 120px diameter semi-circle:
 
 This reduces CPU usage by ~80% for the slow-changing data.
 
+---
+
+## Current Display Layout
+
+```
++------------------------------------------------------------------------------+
+| TrueNAS SCALE 24.10.0          192.168.1.100          eth0 10G  *  5d 12h    |
+|------------------------------------------------------------------------------|
+|                                                                              |
+|      [wave visualization]                    [wave visualization]            |
+|                                                                              |
+|      V  452.3        Mb/s                    ^  234.1        Mb/s            |
+|                                                                              |
+|------------------------------------------------------------------------------|
+|        (78)            (62)            (45)            (12)                   |
+|         CPU             RAM           fastpool          tank                 |
++------------------------------------------------------------------------------+
+|  *  <- Red dot when user logged in
+```
+
+Gauges dynamically size based on item count (CPU + RAM + non-boot ZFS pools, max 6).
+Boot pools are filtered out automatically. Gauge thickness and radius scale down
+as more pools are discovered to keep everything fitting cleanly.
+
+### Notification Box (overlays center)
+
+```
+              +---------------------------+
+              |   Scrub: tank 45.2%       |  <- Yellow (warning)
+              +---------------------------+
+
+              +---------------------------+
+              |   DEGRADED: tank          |  <- Red (danger)
+              +---------------------------+
+```
+
+### Color Coding
+
+- **Download**: Teal/Cyan
+- **Upload**: Blue
+- **Gauges** (CPU/RAM/Pools):
+  - Green: < 75%
+  - Yellow: 75-90%
+  - Red: > 90%
+- **Notifications**:
+  - Info: White background, black text
+  - Warning: Yellow background, black text
+  - Danger: Red background, white text
+- **Login Indicator**: Bright red dot (bottom-left)
+
