@@ -1,204 +1,183 @@
-# WTR Display - TrueNAS Network Monitor
+# WTR Display
 
-![Display Data](docs/screenshot.png)
+Readable, rotating or fixed TrueNAS views for the AOOSTAR WTR MAX front panel.
+Native Go rendering, no browser or web server, and differential RGB565 transfers.
 
-A Go application to display TrueNAS system statistics on the WTR MAX / AOOSTAR front panel LCD display.
+![Animated tour of the rotating views, fixed network view, line waves and a critical alert](docs/showcase.gif)
 
-> **Note**: This project is specifically built for **TrueNAS SCALE** running on AOOSTAR WTR MAX hardware. It's tailored to my personal use case. If you need different features or want to adapt it for other systems, please fork this repository.
+*Rendered by the application at 960 × 376 with synthetic sample data. The tour
+uses shorter page dwell times; hardware animation speed depends on the selected
+profile and USB transfer cost.*
 
-## Acknowledgments
+[Download v1.11.0](https://github.com/lennarkivistik/aoostar-wtr-max-truenas-display/releases/tag/v1.11.0)
+· [Still previews](docs/previews)
 
-This project was made possible thanks to [zehnm/aoostar-rs](https://github.com/zehnm/aoostar-rs) and their reverse engineering efforts of the AOOSTAR display protocol. Their work documenting the proprietary serial protocol, image format, and control commands enabled this Go implementation. Thank you!
+## Views
 
-## Features
+- **Network:** large download/upload rates and cyan/blue filled waves.
+- **Storage:** one pool per page, usable capacity, available space and actual ZFS health.
+- **System:** CPU load and temperature, available RAM and measured ZFS ARC usage.
+- **Drives:** six SATA and five NVMe bays, occupancy and available kernel temperatures.
 
-- **Network Throughput**: Real-time upload/download speeds with animated wave visualization
-- **System Information**: TrueNAS version, IP address, interface name, link speed, uptime
-- **CPU Usage**: Live CPU utilization with color-coded arc gauge
-- **Memory Usage**: RAM utilization percentage with arc gauge
-- **ZFS Pool Status**: Auto-discovers pools (boot pools filtered), dynamic gauge sizing for 2-6 items
-- **Notifications**: External scripts can send notifications to the display
-- **Screenshots**: Capture current display to PNG file
-- **Login Indicator**: Red dot shows when users are logged into shell
-- **ZFS Maintenance Alerts**: Automatic notifications for scrub, resilver, degraded pools
-- **Night Mode**: Schedule display off/on times
-- **Auto Mode**: Smart FPS scaling based on activity
+Rotation defaults to 10 seconds per page. Every non-boot pool gets a storage
+page. Fixed mode keeps live measurements on one selected view. Critical faults
+interrupt either mode; informational notifications cannot cover them. Missing
+readings show as unknown. Occupied bays do not imply SMART health.
 
-## Display Specifications
+## Build and preview
 
-- **Resolution**: 960 x 376 pixels
-- **Connection**: USB UART (VID:PID `0416:90A1`)
-- **Protocol**: Proprietary serial protocol with RGB565 image data
-- **Device**: Typically `/dev/ttyACM0` on Linux
+Requires Go 1.24 or newer. The Linux runtime needs ZFS tools and access to the
+AOOSTAR display (`0416:90A1`, usually `/dev/ttyACM0`, 960 x 376 pixels).
 
-## Installation
+```sh
+./build.sh linux amd64 v1.11.0
 
-### Install on TrueNAS SCALE (Recommended)
-
-Download the latest release binary and set it up to start automatically on boot.
-
-#### 1. Download the binary
-
-SSH into your TrueNAS box and download the latest release to a persistent dataset:
-
-```bash
-mkdir -p /mnt/tank/apps/wtr-display
-cd /mnt/tank/apps/wtr-display
-
-# Download the latest release (replace version as needed)
-wget https://github.com/lennarkivistik/aoostar-wtr-max-truenas-display/releases/download/v1.0.1/wtr-display-linux-amd64-v1.0.1
-chmod +x wtr-display-linux-amd64-v1.0.1
+# Works on a development computer, without a display or TrueNAS.
+go run . --preview build/previews
 ```
 
-> Replace `/mnt/tank/` with your own pool/dataset path. The binary must live on a dataset so it survives reboots and updates.
+Previews contain deterministic **demo data**. `--screenshot` captures the last
+successfully transmitted frame from a running instance.
 
-#### 2. Create a start script
+## Choose a view
 
-Create `/mnt/tank/apps/wtr-display/start.sh`:
+```sh
+# Rotate through network, each storage pool, system and drives.
+./wtr-display --iface eth0
 
-```bash
-#!/bin/sh
-exec /mnt/tank/apps/wtr-display/wtr-display-linux-amd64-v1.0.1 --iface enp101s0 --auto >/dev/null 2>&1
+# Keep one live view on screen. The wave still animates.
+./wtr-display --iface eth0 --view network
+
+# Pin one pool, with no automatic page changes.
+./wtr-display --iface eth0 --view storage --pool tank
+
+# Choose the rotation and dwell time.
+./wtr-display --iface eth0 --views network,system,storage --view-duration 12s
+
+# A quieter network view without animation.
+./wtr-display --iface eth0 --view network --wave-style off
 ```
 
-Then make it executable:
+`--view` and `--views` are mutually exclusive. A fixed storage view without
+`--pool` selects the first non-boot pool. The selected pool and page count remain
+visible; use `--pool` to choose another. A missing requested pool displays an
+unavailable message instead of silently selecting a different pool.
 
-```bash
-chmod +x /mnt/tank/apps/wtr-display/start.sh
+## Appearance and resource use
+
+```sh
+./wtr-display --iface eth0 --profile eco
+./wtr-display --iface eth0 --profile smooth --wave-history 30s
+./wtr-display --iface eth0 --view network --wave-scale link
 ```
 
-> Adjust `--iface` to your network interface. Run `./wtr-display-linux-amd64-v1.0.1 --list-ifaces` to see available interfaces. Don't background the process with `&` -- `exec` replaces the shell cleanly.
+| Option | Default | Behavior |
+|---|---|---|
+| `--view NAME` | unset | Pin `network`, `storage`, `system` or `drives` |
+| `--views LIST` | `network,storage,system,drives` | Ordered rotating views |
+| `--view-duration` | `10s` | Page dwell, 3s–1h |
+| `--pool NAME` | unset | Select a storage pool |
+| `--profile` | `balanced` | `eco` up to 1 FPS, `balanced` up to 4, `smooth` up to 8 |
+| `--wave-style` | `filled` | `filled`, `line` or `off` |
+| `--wave-history` | `20s` | Visible history, 5s–5m |
+| `--wave-scale` | `adaptive` | Adaptive scale or fixed link capacity |
+| `--wave-fps` | profile-dependent | Requested wave FPS, 1–10 |
+| `--frame-interval` | profile-dependent | Requested interval, 100ms–1h; overrides FPS |
+| `--samples` | `20` | Legacy history alias in seconds; `--wave-history` wins |
+| `--preview DIR` | unset | Write demo PNGs without opening hardware |
 
-#### 3. Add as Init Script in TrueNAS UI
+Manual timing requests remain bounded by CPU load and observed transfer cost.
+Low traffic also reduces animation cadence. A flat, settled wave sleeps; static
+views skip rendering and conversion when visible values have not changed.
+Critical status changes and page rotation do not wait for long manual intervals.
 
-1. Go to **System Settings > Advanced > Init/Shutdown Scripts > Add**
-2. Configure:
-   - **Type**: Script
-   - **Script**: `/mnt/tank/apps/wtr-display/start.sh`
-   - **When**: Post Init
-   - **Enabled**: Yes
-   - **Timeout**: 10 seconds
+The sampler reads network counters once per second; intermediate wave frames
+interpolate history, not additional measurements. Adaptive scale is labelled
+and must not be interpreted as percentage of link capacity. If link speed is
+unavailable, link scaling falls back to adaptive scaling.
 
-The display will now start automatically on every boot after networking is up.
+## Night schedule
 
-### Build from Source
-
-```bash
-# Build for Linux x86_64 (TrueNAS)
-./build.sh linux amd64 v1.0.1
-
-# Output: build/linux-amd64/wtr-display-linux-amd64-v1.0.1
+```sh
+./wtr-display --iface eth0 --off-time 23:00 --on-time 10:00
+./wtr-display --iface eth0 --night-mode on
+./wtr-display --iface eth0 --auto --night-mode off
 ```
 
-### Deploy Manually
+Profiles always manage resource use. `--auto` retains the previous default
+23:00–10:00 night schedule for existing startup scripts. `--night-mode off`
+overrides it; `--night-mode on` enables the default schedule without `--auto`.
+Explicit times override defaults. Both times must be valid, different HH:MM
+values. Scheduling uses the NAS's local timezone. Network history resets on wake.
 
-```bash
-# Copy binary to TrueNAS
-scp build/linux-amd64/wtr-display-linux-amd64-v1.0.1 root@truenas:/mnt/tank/apps/wtr-display/
+## Notifications and controls
 
-# On TrueNAS, make executable
-chmod +x wtr-display-linux-amd64-v1.0.1
-```
-
-## Usage
-
-### Basic Commands
-
-```bash
-# Turn display on
+```sh
+./wtr-display --notify 'Backup complete'
+./wtr-display --notify 'Maintenance starting' --notify-type warning --notify-duration 20
+./wtr-display --notify 'Drive failure' --notify-type danger --notify-duration 0
+./wtr-display --screenshot /tmp/display.png
 ./wtr-display --on
-
-# Turn display off
 ./wtr-display --off
-
-# List available network interfaces
 ./wtr-display --list-ifaces
-
-# Show version
 ./wtr-display --version
 ```
 
-### Monitor Mode (Main Feature)
+Notification types: `info`, `warning`, `danger`. Duration: 0–86400 seconds;
+0 persists until replaced. Messages are limited to 512 characters and 4096-byte
+JSON requests. IPC remains at `/tmp/wtr-display.sock`, writable by local users
+for compatibility. Treat local socket access as permission to display messages
+and request screenshots. A second instance refuses to replace a live socket.
+On/off commands are intended for use while the monitor is stopped.
 
-```bash
-# Monitor network interface (auto-detect display)
-./wtr-display --iface eth0
+## TrueNAS installation
 
-# With specific device
-./wtr-display --device /dev/ttyACM0 --iface eth0
+Keep the binary and startup script on a persistent dataset, for example
+`/mnt/POOL/apps/wtr-display`. First run the selected binary in the
+foreground to check the display. Device access normally requires root or the
+appropriate existing serial-device permission.
 
-# With night mode (display off 23:00-10:00)
-./wtr-display --iface eth0 --off-time 23:00 --on-time 10:00
+For an Init/Shutdown **Post Init script**, launch the long-running process in the
+background so the init job can return instead of timing out:
 
-# Auto mode (smart FPS + default night mode 23:00-10:00)
-./wtr-display --iface eth0 --auto
-
-# Custom animation settings
-./wtr-display --iface eth0 --wave-fps 8 --samples 10
+```sh
+#!/bin/sh
+APP_DIR=/mnt/POOL/apps/wtr-display
+nohup "$APP_DIR/wtr-display-linux-amd64-v1.11.0" \
+  --iface eth0 --auto \
+  >"$APP_DIR/display.log" 2>&1 </dev/null &
 ```
 
-### Notifications
+Replace `POOL` with your dataset's pool and `eth0` with the interface reported
+by `--list-ifaces`. Save this as `start.sh`, make it executable with
+`chmod +x start.sh`, then add its **absolute path** as an enabled **Script** in
+TrueNAS **Init/Shutdown Scripts**, with **When: Post Init** and **Timeout: 10**.
+The timeout applies to the launcher, which returns immediately; the monitor
+continues in the background. Check `display.log` after launching. This is a
+startup hook, not a supervisor that automatically restarts a crashed process.
 
-Send notifications to a running display instance:
+Keep the previous binary and a copy of `start.sh` before replacing a version.
+Stop the old process before starting the replacement. The application handles
+SIGTERM/SIGINT and removes its socket on a normal shutdown. Routine per-second
+console logging is disabled; startup information and failures go to the log.
 
-```bash
-# Info notification (default 10 seconds)
-./wtr-display --notify "Backup complete"
+## Verification
 
-# Warning notification (5 seconds)
-./wtr-display --notify "Scrub starting" --notify-type warning --notify-duration 5
-
-# Danger notification (persistent until replaced)
-./wtr-display --notify "Drive failure!" --notify-type danger --notify-duration 0
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+./wtr-display --bench-display noop --bench-frames 100 --bench-json
+./wtr-display --bench-display dirty --bench-frames 50 --bench-json
 ```
 
-Or via Unix socket directly:
-```bash
-echo '{"message":"Hello","theme":"warning","duration":10}' | nc -U /tmp/wtr-display.sock
-```
+Hardware benchmarks open and update the display; run them with the monitor
+stopped. They report conversion, diff, transfer time, changed chunks, bytes and
+writes. Preserve the 47-byte chunk protocol; do not assume bulk-write batching
+works on every firmware. Local render timings do not predict USB transfer speed.
 
-### Screenshots
+[Design](docs/DESIGN.md) · [Development](docs/DEVELOPMENT.md) ·
+[Implementation specification](docs/ROTATING-DISPLAY.md)
 
-Capture the current display to a PNG file:
-
-```bash
-# Save screenshot from running display
-./wtr-display --screenshot /tmp/display.png
-```
-
-### All Options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--device` | Serial device path | Auto-detect |
-| `--on` | Turn display on and exit | - |
-| `--off` | Turn display off and exit | - |
-| `--iface` | Network interface to monitor | - |
-| `--list-ifaces` | List available interfaces | - |
-| `--version` | Show version | - |
-| `--wave-fps` | Animation frames per second | 4 |
-| `--samples` | Sparkline history samples | 5 |
-| `--frame-interval` | Override update interval (e.g., `500ms`) | - |
-| `--auto` | Smart FPS + default night mode | false |
-| `--off-time` | Night mode start (HH:MM) | - |
-| `--on-time` | Night mode end (HH:MM) | - |
-| `--no-cache` | Disable frame caching | false |
-| `--notify` | Send notification to running display | - |
-| `--notify-type` | Notification type: `info`, `warning`, `danger` | info |
-| `--notify-duration` | Notification duration in seconds (0=persistent) | 10 |
-| `--screenshot` | Save screenshot from running display (PNG) | - |
-
-## Documentation
-
-- [Design Concepts](docs/DESIGN.md) -- display layout, color coding, gauge design
-- [Development Guide](docs/DEVELOPMENT.md) -- architecture, data sources, protocol details, coding conventions
-
-## Requirements
-
-- Linux system with ZFS (for pool monitoring)
-- WTR MAX / AOOSTAR device with front panel display
-- Go 1.24+ (only for building from source)
-
-## License
-
-[Apache License, Version 2.0](LICENSE)
+Protocol research: [zehnm/aoostar-rs](https://github.com/zehnm/aoostar-rs).
+License: [Apache-2.0](LICENSE).

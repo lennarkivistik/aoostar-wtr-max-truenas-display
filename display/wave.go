@@ -19,6 +19,10 @@ type Point struct {
 // drawVerticalLineAlpha draws a vertical line with alpha blending.
 // OPTIMIZED: Calculates offset once and increments by stride.
 func drawVerticalLineAlpha(img *image.RGBA, x, yStart, yEnd int, c color.Color) {
+	drawVerticalLineNRGBA(img, x, yStart, yEnd, color.NRGBAModel.Convert(c).(color.NRGBA))
+}
+
+func drawVerticalLineNRGBA(img *image.RGBA, x, yStart, yEnd int, straight color.NRGBA) {
 	bounds := img.Bounds()
 	if x < bounds.Min.X || x >= bounds.Max.X {
 		return
@@ -33,11 +37,7 @@ func drawVerticalLineAlpha(img *image.RGBA, x, yStart, yEnd int, c color.Color) 
 		return
 	}
 
-	r, g, b, a := c.RGBA()
-	srcR := uint32(r >> 8)
-	srcG := uint32(g >> 8)
-	srcB := uint32(b >> 8)
-	srcA := uint32(a >> 8)
+	srcR, srcG, srcB, srcA := uint32(straight.R), uint32(straight.G), uint32(straight.B), uint32(straight.A)
 
 	if srcA == 0 {
 		return
@@ -77,55 +77,56 @@ func DrawTimestampedWave(img *image.RGBA, screenY, screenHeight, waveWidth int, 
 
 	screenWidth := Width
 
-	type ScreenPoint struct {
-		X int
-		Y float64
+	lr, lg, lb, la := lineColor.RGBA()
+	lineR, lineG, lineB := uint8(lr>>8), uint8(lg>>8), uint8(lb>>8)
+	lineA := la
+
+	var fillR, fillG, fillB uint8
+	var fillA uint32
+	var fillStraight color.NRGBA
+	hasFill := fillColor != nil
+	if hasFill {
+		fillStraight = color.NRGBAModel.Convert(fillColor).(color.NRGBA)
+		fr, fg, fb, fa := fillColor.RGBA()
+		fillR, fillG, fillB = uint8(fr>>8), uint8(fg>>8), uint8(fb>>8)
+		fillA = fa
 	}
 
-	var screenPoints []ScreenPoint
-	for _, p := range points {
-		screenPoints = append(screenPoints, ScreenPoint{X: int(p.X), Y: p.Y})
-	}
+	for i := 0; i < len(points)-1; i++ {
+		p1 := points[i]
+		p2 := points[i+1]
 
-	if len(screenPoints) < 2 {
-		return
-	}
+		p1X := int(p1.X)
+		p2X := int(p2.X)
+		startX := p1X
+		endX := p2X
 
-	for i := 0; i < len(screenPoints)-1; i++ {
-		p0 := screenPoints[max(0, i-1)]
-		p1 := screenPoints[i]
-		p2 := screenPoints[i+1]
-		p3 := screenPoints[min(len(screenPoints)-1, i+2)]
+		if startX < 0 {
+			startX = 0
+		}
+		if endX > screenWidth {
+			endX = screenWidth
+		}
+		if startX >= endX {
+			continue
+		}
 
-		startX := p1.X
-		endX := p2.X
-
-		if startX < 0 { startX = 0 }
-		if endX > screenWidth { endX = screenWidth }
-		if startX >= endX { continue }
-
-		segmentWidth := p2.X - p1.X
-		if segmentWidth <= 0 { continue }
-
-		lr, lg, lb, la := lineColor.RGBA()
-		lineR, lineG, lineB := uint8(lr>>8), uint8(lg>>8), uint8(lb>>8)
-		lineA := la
-
-		var fillR, fillG, fillB uint8
-		var fillA uint32
-		hasFill := fillColor != nil
-		if hasFill {
-			fr, fg, fb, fa := fillColor.RGBA()
-			fillR, fillG, fillB = uint8(fr>>8), uint8(fg>>8), uint8(fb>>8)
-			fillA = fa
+		segmentWidth := p2X - p1X
+		if segmentWidth <= 0 {
+			continue
 		}
 
 		for px := startX; px < endX; px++ {
-			t := float64(px-p1.X) / float64(segmentWidth)
-			curveY := catmullRom(p0.Y, p1.Y, p2.Y, p3.Y, t)
+			t := float64(px-p1X) / float64(segmentWidth)
+			// Smoothstep cannot invent peaks or negative troughs between samples.
+			curveY := p1.Y + (p2.Y-p1.Y)*t*t*(3-2*t)
 
-			if curveY < 0 { curveY = 0 }
-			if curveY > 1 { curveY = 1 }
+			if curveY < 0 {
+				curveY = 0
+			}
+			if curveY > 1 {
+				curveY = 1
+			}
 
 			screenYpos := screenY + screenHeight - int(curveY*float64(screenHeight))
 
@@ -146,7 +147,9 @@ func DrawTimestampedWave(img *image.RGBA, screenY, screenHeight, waveWidth int, 
 
 			if hasFill && curveY > 0.02 {
 				fillStart := screenYpos + 2
-				if fillStart < screenY { fillStart = screenY }
+				if fillStart < screenY {
+					fillStart = screenY
+				}
 				fillEnd := screenY + screenHeight
 
 				if fillA == 0xFFFF {
@@ -154,7 +157,7 @@ func DrawTimestampedWave(img *image.RGBA, screenY, screenHeight, waveWidth int, 
 						setPixel(img, px, py, fillR, fillG, fillB, 255)
 					}
 				} else if fillA > 0 {
-					drawVerticalLineAlpha(img, px, fillStart, fillEnd, fillColor)
+					drawVerticalLineNRGBA(img, px, fillStart, fillEnd, fillStraight)
 				}
 			}
 		}
@@ -163,7 +166,9 @@ func DrawTimestampedWave(img *image.RGBA, screenY, screenHeight, waveWidth int, 
 
 // DrawWavePacket draws a wave at a specific horizontal position.
 func DrawWavePacket(img *image.RGBA, progress float64, screenY, screenHeight, packetWidth int, values []float64, lineColor, fillColor color.Color) {
-	if len(values) < 3 { return }
+	if len(values) < 3 {
+		return
+	}
 
 	screenWidth := Width
 	startX := screenWidth + packetWidth/2
@@ -175,15 +180,25 @@ func DrawWavePacket(img *image.RGBA, progress float64, screenY, screenHeight, pa
 
 	drawStartX := waveStartX
 	drawEndX := waveEndX
-	if drawStartX < 0 { drawStartX = 0 }
-	if drawEndX > screenWidth { drawEndX = screenWidth }
-	if drawStartX >= drawEndX { return }
+	if drawStartX < 0 {
+		drawStartX = 0
+	}
+	if drawEndX > screenWidth {
+		drawEndX = screenWidth
+	}
+	if drawStartX >= drawEndX {
+		return
+	}
 
 	maxVal := 0.0
 	for _, v := range values {
-		if v > maxVal { maxVal = v }
+		if v > maxVal {
+			maxVal = v
+		}
 	}
-	if maxVal <= 0.0001 { maxVal = 1 }
+	if maxVal <= 0.0001 {
+		maxVal = 1
+	}
 	maxVal = maxVal * 1.1
 
 	var points []Point
@@ -199,11 +214,19 @@ func DrawWavePacket(img *image.RGBA, progress float64, screenY, screenHeight, pa
 		localX := float64(px - waveStartX)
 		relX := localX / xStep
 		idx := int(relX)
-		if idx < 0 { idx = 0 }
-		if idx >= len(points)-1 { idx = len(points) - 2 }
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(points)-1 {
+			idx = len(points) - 2
+		}
 		t := relX - float64(idx)
-		if t < 0 { t = 0 }
-		if t > 1 { t = 1 }
+		if t < 0 {
+			t = 0
+		}
+		if t > 1 {
+			t = 1
+		}
 
 		p0 := points[max(0, idx-1)]
 		p1 := points[idx]
@@ -231,12 +254,16 @@ func DrawWavePacket(img *image.RGBA, progress float64, screenY, screenHeight, pa
 
 // DrawSmoothWave draws a fluid, curved wave graph with opacity fill.
 func DrawSmoothWave(img *image.RGBA, x, y, width, height int, values []float64, lineColor color.Color, fillColor color.Color) {
-	if len(values) < 2 { return }
+	if len(values) < 2 {
+		return
+	}
 
 	minVal, maxVal := getMinMax(values)
 	maxVal = maxVal * 1.1
 	valueRange := maxVal - minVal
-	if valueRange <= 0.0001 { valueRange = 1 }
+	if valueRange <= 0.0001 {
+		valueRange = 1
+	}
 
 	var points []Point
 	xStep := float64(width) / float64(len(values)-1)
@@ -250,7 +277,9 @@ func DrawSmoothWave(img *image.RGBA, x, y, width, height int, values []float64, 
 	for px := 0; px < width; px++ {
 		relX := float64(px) / xStep
 		idx := int(relX)
-		if idx >= len(points)-1 { idx = len(points) - 2 }
+		if idx >= len(points)-1 {
+			idx = len(points) - 2
+		}
 		t := relX - float64(idx)
 
 		p0 := points[max(0, idx-1)]
@@ -287,21 +316,31 @@ func catmullRom(p0, p1, p2, p3, t float64) float64 {
 }
 
 func max(a, b int) int {
-	if a > b { return a }
+	if a > b {
+		return a
+	}
 	return b
 }
 
 func min(a, b int) int {
-	if a < b { return a }
+	if a < b {
+		return a
+	}
 	return b
 }
 
 func getMinMax(values []float64) (float64, float64) {
 	minVal, maxVal := values[0], values[0]
 	for _, v := range values {
-		if v < minVal { minVal = v }
-		if v > maxVal { maxVal = v }
+		if v < minVal {
+			minVal = v
+		}
+		if v > maxVal {
+			maxVal = v
+		}
 	}
-	if maxVal == minVal { maxVal += 1.0 }
+	if maxVal == minVal {
+		maxVal += 1.0
+	}
 	return minVal, maxVal
 }

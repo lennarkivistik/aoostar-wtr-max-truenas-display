@@ -4,382 +4,420 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"math"
 	"strings"
+	"time"
 
 	"go-wtr-display/display"
 	"go-wtr-display/network"
 )
 
-// Layout constants for 960x376 display
-const (
-	headerHeight = 52
-	speedsHeight = 210
-	statsHeight  = 114
-)
-
-// Enhanced color palette
 var (
-	colorBackground = color.RGBA{15, 23, 42, 255}    // Dark navy background
-	colorTeal       = color.RGBA{34, 211, 238, 255}  // Bright Cyan/Teal (Download)
-	colorBlue       = color.RGBA{96, 165, 250, 255}  // Bright Blue (Upload)
-	colorWhite      = color.RGBA{255, 255, 255, 255} // Pure White
-	colorBrightGray = color.RGBA{203, 213, 225, 255} // Bright Gray (Text)
-	colorGray       = color.RGBA{148, 163, 184, 255} // Muted Gray (Secondary)
-	colorDarkGray   = color.RGBA{51, 65, 85, 255}    // Separator lines
-	colorGaugeBg    = color.RGBA{30, 41, 59, 255}    // Gauge background
-	colorGreen      = color.RGBA{74, 222, 128, 255}  // Bright Green (Good)
-	colorYellow     = color.RGBA{250, 204, 21, 255}  // Bright Yellow (Warning)
-	colorRed        = color.RGBA{248, 113, 113, 255} // Bright Red (Critical)
-	colorAlertBg    = color.RGBA{127, 29, 29, 255}   // Alert bar background
-
-	// Transparent fills for overlapping waves
-	colorTealFill = color.RGBA{34, 211, 238, 60} // Transparent Teal
-	colorBlueFill = color.RGBA{96, 165, 250, 60} // Transparent Blue
-
-	// Notification theme colors
-	colorNotifInfoBg     = color.RGBA{255, 255, 255, 255} // White background
-	colorNotifInfoText   = color.RGBA{0, 0, 0, 255}       // Black text
-	colorNotifWarnBg     = color.RGBA{250, 204, 21, 255}  // Yellow background
-	colorNotifWarnText   = color.RGBA{0, 0, 0, 255}       // Black text
-	colorNotifDangerBg   = color.RGBA{220, 38, 38, 255}   // Red background
-	colorNotifDangerText = color.RGBA{255, 255, 255, 255} // White text
-
-	// Login indicator
-	colorLoginDot = color.RGBA{239, 68, 68, 255} // Bright red dot
+	colorBackground = color.RGBA{8, 15, 24, 255}
+	colorWhite      = color.RGBA{241, 247, 252, 255}
+	colorGray       = color.RGBA{165, 185, 202, 255}
+	colorMuted      = color.RGBA{75, 95, 114, 255}
+	colorLine       = color.RGBA{30, 48, 65, 255}
+	colorTeal       = color.RGBA{35, 218, 221, 255}
+	colorBlue       = color.RGBA{104, 166, 255, 255}
+	colorGreen      = color.RGBA{80, 220, 155, 255}
+	colorYellow     = color.RGBA{255, 199, 90, 255}
+	colorRed        = color.RGBA{255, 111, 117, 255}
 )
 
-// RenderStaticLayer renders the background elements that don't change often.
-func RenderStaticLayer(img *image.RGBA, renderer *display.TextRenderer, state *State) {
-	// Clear background
+// FrameRenderer caches the entire non-animated view. The key uses displayed
+// precision, so hidden metrics and insignificant changes do not trigger work.
+type FrameRenderer struct {
+	text        *display.TextRenderer
+	base, frame *image.RGBA
+	key         string
+}
+
+func NewFrameRenderer() *FrameRenderer {
+	return &FrameRenderer{text: display.NewTextRenderer(), base: display.NewDisplayImage(), frame: display.NewDisplayImage()}
+}
+
+func (r *FrameRenderer) Frame(s *State, p Page, o Options, now time.Time, force bool) (*image.RGBA, bool) {
+	key := visualKey(s, p, o)
+	waveVisible := p.View == ViewNetwork && o.WaveStyle != "off" && s.NetworkAvailable && s.WaveAnimator != nil && !CurrentHealth(s).Critical && s.GetActiveNotification() == nil
+	moving := waveVisible && s.WaveAnimator.HasMotion(now)
+	if key == r.key && !moving && !force {
+		return nil, false
+	}
+	if key != r.key || force {
+		renderBase(r.base, r.text, s, p, o)
+		r.key = key
+	}
+	display.CopyImage(r.frame, r.base)
+	if waveVisible {
+		renderWave(r.frame, s, o, now)
+	}
+	return r.frame, true
+}
+
+func visualKey(s *State, p Page, o Options) string {
+	h := CurrentHealth(s)
+	key := fmt.Sprintf("%v|%v|%v|%t|%s", p, h, o.Views, o.Fixed, o.Pool)
+	if n := s.GetActiveNotification(); n != nil {
+		key += fmt.Sprintf("|%s|%s", n.Theme, n.Message)
+	}
+	if h.Critical {
+		return key
+	}
+	switch p.View {
+	case ViewNetwork:
+		rx := formatSpeedParts(s.DisplayRxSpeed, &s.LastRxUnit)
+		tx := formatSpeedParts(s.DisplayTxSpeed, &s.LastTxUnit)
+		key += fmt.Sprintf("|%v|%v|%t|%d|%s|%s|%s|%v", rx, tx, s.NetworkAvailable, s.LinkSpeed, s.Interface, s.IPAddress, o.WaveStyle, o.WaveHistory)
+	case ViewStorage:
+		pools := visiblePools(s.Pools)
+		if p.Pool >= 0 && p.Pool < len(pools) {
+			key += fmt.Sprintf("|%v|%s", pools[p.Pool], poolHealth(s, pools[p.Pool].Name))
+		}
+		key += fmt.Sprintf("|%d", len(pools))
+	case ViewSystem:
+		key += fmt.Sprintf("|%.0f|%t|%s|%s|%s", s.DisplayCPU, s.CPUAvailable, s.TrueNASVersion, s.IPAddress, s.Uptime)
+		if s.Memory != nil {
+			key += fmt.Sprintf("|%.1f|%.0f", s.Memory.AvailableGB, s.Memory.TotalGB)
+		}
+		if s.ARC != nil {
+			key += fmt.Sprintf("|%.1f", s.ARC.SizeGB)
+		}
+		if s.Temperatures.CPU != nil {
+			key += fmt.Sprintf("|%.0f", *s.Temperatures.CPU)
+		}
+	case ViewDrives:
+		for _, slot := range s.Disks {
+			temp, ok := s.Temperatures.Disks[slot.Device]
+			key += fmt.Sprintf("|%s:%d:%t:%.0f:%t", slot.Kind, slot.Bay, slot.Present, temp, ok)
+		}
+	}
+	if len(s.LoggedInUsers) > 0 {
+		key += "|shell"
+	}
+	return key
+}
+
+func renderBase(img *image.RGBA, r *display.TextRenderer, s *State, p Page, o Options) {
 	display.FillImage(img, colorBackground)
-
-	// Row 1: Header (0-52px)
-	renderHeader(img, renderer, state)
-
-	// Separator line
-	display.DrawLine(img, 20, headerHeight-1, display.Width-20, colorDarkGray)
-
-	// Row 3: Stats tiles (262-376px)
-	renderStatsTiles(img, renderer, state)
-
-	// Separator line (between speeds and stats)
-	display.DrawLine(img, 20, headerHeight+speedsHeight-1, display.Width-20, colorDarkGray)
-}
-
-// RenderAndSend renders dynamic elements and sends the frame to the display.
-func RenderAndSend(d *display.Display, img *image.RGBA, bgImg *image.RGBA, renderer *display.TextRenderer, state *State) {
-	// 1. Copy static background (fast)
-	display.CopyImage(img, bgImg)
-
-	// 2. Draw dynamic elements (Waves + Speeds)
-	renderSpeeds(img, renderer, state)
-
-	// 3. Alert overlay (if any)
-	if len(state.Alerts) > 0 {
-		renderAlertBar(img, renderer, state.Alerts[0])
+	h := CurrentHealth(s)
+	accent := colorGreen
+	if h.Warning {
+		accent = colorYellow
 	}
-
-	// 4. Login indicator (red dot in bottom-left if users logged in)
-	if len(state.LoggedInUsers) > 0 {
-		renderLoginIndicator(img)
+	if h.Critical {
+		accent = colorRed
 	}
-
-	// 5. Notification overlay (on top of everything)
-	if state.ActiveNotification != nil {
-		renderNotificationBox(img, renderer, state.ActiveNotification)
+	title := strings.ToUpper(string(p.View))
+	if h.Critical {
+		title = "ATTENTION"
 	}
-
-	// 6. Store frame for screenshots
-	state.SetLastFrame(img)
-
-	// 7. Send to display
-	if err := d.SendImage(img); err != nil {
-		fmt.Printf("\nError sending image: %v\n", err)
+	r.DrawText(img, 28, 37, title, colorWhite, 30, true)
+	label := h.Title
+	if !h.Critical && h.Detail != "" {
+		label += " / " + h.Detail
 	}
-}
-
-func renderHeader(img *image.RGBA, renderer *display.TextRenderer, state *State) {
-	y := 36 // Baseline for 28px text in 52px header
-
-	// Left: TrueNAS SCALE version
-	renderer.DrawText(img, 20, y, "TrueNAS SCALE "+state.TrueNASVersion, colorWhite, 28, true)
-
-	// Center: IP address
-	renderer.DrawTextCentered(img, y, state.IPAddress, colorBrightGray, 28, false)
-
-	// Right side: Interface + Link speed + Uptime
-	rightText := state.Interface
-	if state.LinkSpeed > 0 {
-		rightText += " " + network.FormatLinkSpeed(state.LinkSpeed)
-	}
-	rightText += "  •  " + state.Uptime
-
-	rightWidth := renderer.MeasureText(rightText, 26, false)
-	renderer.DrawText(img, display.Width-rightWidth-20, y, rightText, colorGray, 26, false)
-}
-
-func renderSpeeds(img *image.RGBA, renderer *display.TextRenderer, state *State) {
-	baseY := headerHeight
-	height := speedsHeight
-	centerY := baseY + height/2
-
-	// Draw continuously scrolling waves (timestamp-based, no jumping)
-	waveY := baseY + height - 10
-	waveHeight := 100 // Height of the wave visualization
-
-	// Get timestamped wave points from animator
-	if state.WaveAnimator != nil && state.WaveAnimator.HasData() {
-		rxPoints, txPoints := state.WaveAnimator.GetWavePoints(waveHeight)
-		waveWidth, _ := state.WaveAnimator.GetConfig()
-
-		// Draw RX wave (Teal) - download
-		if len(rxPoints) >= 2 {
-			display.DrawTimestampedWave(img, waveY-waveHeight, waveHeight,
-				waveWidth, rxPoints, colorTeal, colorTealFill)
-		}
-
-		// Draw TX wave (Blue) - upload (on top with transparency)
-		if len(txPoints) >= 2 {
-			display.DrawTimestampedWave(img, waveY-waveHeight, waveHeight,
-				waveWidth, txPoints, colorBlue, colorBlueFill)
-		}
-	}
-
-	// Draw Speed Text on top (uses averaged values for stability)
-	rxSpeed := formatSpeedParts(state.DisplayRxSpeed, &state.LastRxUnit)
-	txSpeed := formatSpeedParts(state.DisplayTxSpeed, &state.LastTxUnit)
-
-	// Left side: Download
-	drawSpeedDisplay(img, renderer, 80, centerY-20, "▼", rxSpeed, colorTeal)
-
-	// Right side: Upload
-	drawSpeedDisplay(img, renderer, display.Width/2+80, centerY-20, "▲", txSpeed, colorBlue)
-}
-
-type speedParts struct {
-	Value string
-	Unit  string
-}
-
-// formatSpeedParts formats a speed value with hysteresis to prevent unit
-// flicker at boundaries. Once a unit is entered, the value must drop below
-// 80% of the boundary to switch back down (or rise above the boundary to go up).
-func formatSpeedParts(bytesPerSec float64, lastUnit *string) speedParts {
-	bitsPerSec := bytesPerSec * 8
-	const (
-		Kbps       = 1000
-		Mbps       = Kbps * 1000
-		Gbps       = Mbps * 1000
-		hysteresis = 0.8
-	)
-
-	unit := "b/s"
-	switch {
-	case bitsPerSec >= Gbps:
-		unit = "Gb/s"
-	case bitsPerSec >= Mbps:
-		unit = "Mb/s"
-	case bitsPerSec >= Kbps:
-		unit = "Kb/s"
-	}
-
-	// Apply hysteresis: if the previous unit was higher, stay there until
-	// the value drops decisively below the threshold.
-	if *lastUnit != "" && *lastUnit != unit {
-		switch *lastUnit {
-		case "Gb/s":
-			if bitsPerSec >= float64(Gbps)*hysteresis {
-				unit = "Gb/s"
-			}
-		case "Mb/s":
-			if unit == "Kb/s" && bitsPerSec >= float64(Mbps)*hysteresis {
-				unit = "Mb/s"
-			}
-		case "Kb/s":
-			if unit == "b/s" && bitsPerSec >= float64(Kbps)*hysteresis {
-				unit = "Kb/s"
-			}
-		}
-	}
-	*lastUnit = unit
-
-	switch unit {
-	case "Gb/s":
-		return speedParts{fmt.Sprintf("%.2f", bitsPerSec/Gbps), unit}
-	case "Mb/s":
-		return speedParts{fmt.Sprintf("%.1f", bitsPerSec/Mbps), unit}
-	case "Kb/s":
-		return speedParts{fmt.Sprintf("%.0f", bitsPerSec/Kbps), unit}
-	default:
-		return speedParts{fmt.Sprintf("%.0f", bitsPerSec), unit}
-	}
-}
-
-func drawSpeedDisplay(img *image.RGBA, renderer *display.TextRenderer, x, centerY int, arrow string, speed speedParts, accentColor color.Color) {
-	// Arrow
-	renderer.DrawText(img, x, centerY-10, arrow, accentColor, 80, true)
-
-	// Speed value (huge)
-	valueX := x + 70
-	renderer.DrawText(img, valueX, centerY+10, speed.Value, colorWhite, 120, true)
-
-	// Unit
-	valueWidth := renderer.MeasureText(speed.Value, 120, true)
-	renderer.DrawText(img, valueX+valueWidth+12, centerY-20, speed.Unit, accentColor, 40, false)
-}
-
-// gaugeConfig holds sizing parameters for the dynamic gauge layout.
-// Selected based on how many items need to be displayed.
-type gaugeConfig struct {
-	radius        int
-	thickness     int
-	percentFont   float64
-	labelFont     float64
-	labelMaxChars int
-}
-
-func renderStatsTiles(img *image.RGBA, renderer *display.TextRenderer, state *State) {
-	baseY := headerHeight + speedsHeight
-	tileY := baseY + 5
-
-	type gaugeTile struct {
-		percent float64
-		label   string
-	}
-
-	memPercent := 0.0
-	if state.Memory != nil {
-		memPercent = state.Memory.UsedPercent
-	}
-
-	items := []gaugeTile{
-		{state.DisplayCPU, "CPU"},
-		{memPercent, "RAM"},
-	}
-
-	for _, pool := range state.Pools {
-		if strings.HasPrefix(pool.Name, "boot") {
-			continue
-		}
-		items = append(items, gaugeTile{pool.UsedPercent, pool.Name})
-	}
-
-	if len(items) > 6 {
-		items = items[:6]
-	}
-
-	count := len(items)
-	if count == 0 {
+	label = ellipsize(r, label, 570, 24, true)
+	r.DrawText(img, 932-r.MeasureText(label, 24, true), 36, label, accent, 24, true)
+	display.DrawLine(img, 28, 53, 932, colorLine)
+	renderNavigation(img, r, p, o)
+	if h.Critical {
+		renderMessage(img, r, h.Title, h.Detail, colorRed)
 		return
 	}
-
-	var cfg gaugeConfig
-	if count <= 4 {
-		cfg = gaugeConfig{
-			radius:        44,
-			thickness:     16,
-			percentFont:   36,
-			labelFont:     22,
-			labelMaxChars: 10,
+	if n := s.GetActiveNotification(); n != nil {
+		c := colorTeal
+		if n.Theme == ThemeWarning {
+			c = colorYellow
 		}
-	} else {
-		cfg = gaugeConfig{
-			radius:        38,
-			thickness:     14,
-			percentFont:   32,
-			labelFont:     20,
-			labelMaxChars: 8,
-		}
+		renderMessage(img, r, "NOTICE", n.Message, c)
+		return
 	}
-
-	cellWidth := display.Width / count
-	for i, item := range items {
-		cx := cellWidth/2 + i*cellWidth
-
-		label := item.label
-		if len(label) > cfg.labelMaxChars {
-			label = label[:cfg.labelMaxChars]
-		}
-
-		drawGaugeTile(img, renderer, cx, tileY, item.percent, label, cfg)
-	}
-}
-
-func drawGaugeTile(img *image.RGBA, renderer *display.TextRenderer, cx, y int, percent float64, label string, cfg gaugeConfig) {
-	cy := y + cfg.radius
-	gaugeColor := getUsageColor(percent)
-
-	display.DrawArcGaugeSimple(img, cx, cy, cfg.radius, cfg.thickness, percent, gaugeColor, colorGaugeBg)
-
-	percentText := fmt.Sprintf("%.0f", percent)
-	textWidth := renderer.MeasureText(percentText, cfg.percentFont, true)
-	renderer.DrawText(img, cx-textWidth/2, cy+int(cfg.percentFont/3), percentText, colorWhite, cfg.percentFont, true)
-
-	labelY := cy + int(float64(cfg.radius)*0.75) + 16
-	labelWidth := renderer.MeasureText(label, cfg.labelFont, false)
-	renderer.DrawText(img, cx-labelWidth/2, labelY, label, colorBrightGray, cfg.labelFont, false)
-}
-
-func getUsageColor(percent float64) color.Color {
-	switch {
-	case percent >= 90:
-		return colorRed
-	case percent >= 75:
-		return colorYellow
+	switch p.View {
+	case ViewStorage:
+		renderStorage(img, r, s, p, o)
+	case ViewSystem:
+		renderSystem(img, r, s)
+	case ViewDrives:
+		renderDrives(img, r, s)
 	default:
-		return colorGreen
+		renderNetwork(img, r, s, o)
+	}
+	if len(s.LoggedInUsers) > 0 {
+		// A labelled session indicator avoids confusing shell access with a fault.
+		r.DrawText(img, 812, 363, "SSH", colorGray, 22, true)
 	}
 }
 
-func renderAlertBar(img *image.RGBA, renderer *display.TextRenderer, alert string) {
-	barY := headerHeight + 5
-	barHeight := 36
-	display.DrawFilledRect(img, 20, barY, display.Width-40, barHeight, colorAlertBg)
-	alertText := "⚠ ALERT: " + alert
-	renderer.DrawTextCentered(img, barY+26, alertText, colorWhite, 28, true)
-}
-
-// renderLoginIndicator draws a bright red dot in the bottom-left corner
-// to indicate that users are logged into the shell.
-func renderLoginIndicator(img *image.RGBA) {
-	// Position: bottom-left corner with some padding
-	cx := 20
-	cy := display.Height - 20
-	radius := 8
-
-	display.DrawFilledCircle(img, cx, cy, radius, colorLoginDot)
-}
-
-// renderNotificationBox draws a centered notification box with rounded corners.
-// The box supersedes all other content and is themed based on severity.
-func renderNotificationBox(img *image.RGBA, renderer *display.TextRenderer, notif *Notification) {
-	// Box dimensions
-	boxWidth := 420
-	boxHeight := 70
-	borderRadius := 12
-
-	// Center the box on screen
-	boxX := (display.Width - boxWidth) / 2
-	boxY := (display.Height - boxHeight) / 2
-
-	// Select colors based on theme
-	var bgColor, textColor color.Color
-	switch notif.Theme {
-	case ThemeWarning:
-		bgColor = colorNotifWarnBg
-		textColor = colorNotifWarnText
-	case ThemeDanger:
-		bgColor = colorNotifDangerBg
-		textColor = colorNotifDangerText
-	default: // ThemeInfo
-		bgColor = colorNotifInfoBg
-		textColor = colorNotifInfoText
+func renderNavigation(img *image.RGBA, r *display.TextRenderer, p Page, o Options) {
+	display.DrawLine(img, 28, 337, 932, colorLine)
+	x := 28
+	for _, v := range o.Views {
+		label := strings.ToUpper(string(v))
+		c := colorMuted
+		if v == p.View {
+			c = colorWhite
+			display.DrawFilledRect(img, x, 335, r.MeasureText(label, 22, true), 3, colorTeal)
+		}
+		r.DrawText(img, x, 365, label, c, 22, true)
+		x += r.MeasureText(label, 22, true) + 32
 	}
+	mode := "AUTO"
+	if o.Fixed {
+		mode = "FIXED"
+	}
+	r.DrawText(img, 932-r.MeasureText(mode, 22, true), 365, mode, colorGray, 22, true)
+}
 
-	// Draw rounded rectangle background
-	display.DrawRoundedRect(img, boxX, boxY, boxWidth, boxHeight, borderRadius, bgColor)
+func renderNetwork(img *image.RGBA, r *display.TextRenderer, s *State, o Options) {
+	rx := formatSpeedParts(s.DisplayRxSpeed, &s.LastRxUnit)
+	tx := formatSpeedParts(s.DisplayTxSpeed, &s.LastTxUnit)
+	for i, item := range []struct {
+		label string
+		speed speedParts
+		c     color.Color
+	}{{"DOWNLOAD", rx, colorTeal}, {"UPLOAD", tx, colorBlue}} {
+		x := 32 + i*480
+		drawArrow(img, x+10, 90, i == 0, item.c)
+		r.DrawText(img, x+36, 99, item.label, item.c, 29, true)
+		value, unit := item.speed.Value, item.speed.Unit
+		if !s.NetworkAvailable {
+			value = "--"
+			unit = "unavailable"
+		}
+		drawFit(img, r, x, 201, 330, value, colorWhite, 108, 72, true)
+		r.DrawText(img, x+400-r.MeasureText(unit, 29, false), 200, unit, item.c, 29, false)
+	}
+	meta := s.Interface
+	if s.LinkSpeed > 0 {
+		meta += " / " + network.FormatLinkSpeed(s.LinkSpeed) + " link"
+	}
+	r.DrawText(img, 32, 231, ellipsize(r, meta, 450, 23, false), colorGray, 23, false)
+	scale := "adaptive"
+	if o.WaveScale == "link" && s.LinkSpeed > 0 {
+		scale = "link scale"
+	}
+	history := fmt.Sprintf("%gs / %s", o.WaveHistory.Seconds(), scale)
+	if o.WaveStyle == "off" {
+		history = s.IPAddress
+	}
+	r.DrawText(img, 928-r.MeasureText(history, 23, false), 231, history, colorGray, 23, false)
+	display.DrawLine(img, 0, 320, display.Width, colorLine)
+}
 
-	// Draw text centered in the box
-	textY := boxY + boxHeight/2 + 10 // Baseline adjustment for vertical centering
-	renderer.DrawTextCentered(img, textY, notif.Message, textColor, 28, true)
+func renderWave(img *image.RGBA, s *State, o Options, now time.Time) {
+	ceiling := 0.0
+	if o.WaveScale == "link" && s.LinkSpeed > 0 {
+		ceiling = float64(s.LinkSpeed) * 1e6 / 8
+	}
+	rx, tx := s.WaveAnimator.PointsAt(now, ceiling)
+	var rxFill, txFill color.Color
+	if o.WaveStyle == "filled" {
+		rxFill = color.NRGBA{35, 218, 221, 65}
+		txFill = color.NRGBA{104, 166, 255, 65}
+	}
+	display.DrawTimestampedWave(img, 242, 78, display.Width, rx, colorTeal, rxFill)
+	display.DrawTimestampedWave(img, 242, 78, display.Width, tx, colorBlue, txFill)
+}
+
+func renderStorage(img *image.RGBA, r *display.TextRenderer, s *State, p Page, o Options) {
+	pools := visiblePools(s.Pools)
+	if p.Pool < 0 || p.Pool >= len(pools) || s.PoolReadFailed {
+		detail := "No pool capacity readings"
+		if o.Pool != "" {
+			detail = "Pool not found: " + o.Pool
+		}
+		renderMessage(img, r, "STORAGE UNAVAILABLE", detail, colorYellow)
+		return
+	}
+	pool := pools[p.Pool]
+	r.DrawText(img, 32, 105, ellipsize(r, pool.Name, 650, 42, true), colorWhite, 42, true)
+	health := poolHealth(s, pool.Name)
+	c := colorGray
+	if health == "ONLINE" {
+		c = colorGreen
+	}
+	if health != "ONLINE" && health != "UNKNOWN" {
+		c = colorRed
+	}
+	r.DrawText(img, 928-r.MeasureText(health, 27, true), 100, health, c, 27, true)
+	drawFit(img, r, 28, 250, 430, fmt.Sprintf("%.0f%%", pool.UsedPercent), colorWhite, 140, 100, true)
+	r.DrawText(img, 520, 158, "AVAILABLE", colorGray, 29, true)
+	drawFit(img, r, 515, 242, 405, pool.Free, colorTeal, 86, 58, true)
+	display.DrawFilledRect(img, 32, 278, 896, 14, colorLine)
+	used := int(896 * math.Max(0, math.Min(100, pool.UsedPercent)) / 100)
+	display.DrawFilledRect(img, 32, 278, used, 14, colorTeal)
+	summary := pool.Used + " used / " + pool.Size + " usable"
+	r.DrawText(img, 32, 325, ellipsize(r, summary, 740, 27, false), colorGray, 27, false)
+	count := fmt.Sprintf("%d / %d", p.Pool+1, len(pools))
+	r.DrawText(img, 928-r.MeasureText(count, 23, false), 325, count, colorGray, 23, false)
+}
+
+func poolHealth(s *State, name string) string {
+	if s.ZFSStatus != nil && !s.ZFSReadFailed {
+		if h := s.ZFSStatus.PoolStates[name]; h != "" {
+			return h
+		}
+	}
+	return "UNKNOWN"
+}
+
+func renderSystem(img *image.RGBA, r *display.TextRenderer, s *State) {
+	labels := []string{"CPU", "MEMORY", "ZFS CACHE"}
+	for i, label := range labels {
+		r.DrawText(img, 32+i*316, 104, label, colorGray, 30, true)
+	}
+	cpu := "--"
+	if s.CPUAvailable {
+		cpu = fmt.Sprintf("%.0f%%", s.DisplayCPU)
+	}
+	drawFit(img, r, 26, 219, 275, cpu, colorWhite, 100, 68, true)
+	temperature := "TEMP UNAVAILABLE"
+	if s.Temperatures.CPU != nil {
+		temperature = fmt.Sprintf("%.0f°C", *s.Temperatures.CPU)
+	}
+	r.DrawText(img, 32, 270, temperature, colorTeal, 27, true)
+	memory, arc := "--", "--"
+	if s.Memory != nil {
+		memory = fmt.Sprintf("%.1f", s.Memory.AvailableGB)
+	}
+	if s.ARC != nil {
+		arc = fmt.Sprintf("%.1f", s.ARC.SizeGB)
+	}
+	drawFit(img, r, 342, 214, 275, memory, colorWhite, 84, 60, true)
+	drawFit(img, r, 658, 214, 275, arc, colorWhite, 84, 60, true)
+	r.DrawText(img, 348, 266, "GiB AVAILABLE", colorTeal, 26, true)
+	r.DrawText(img, 664, 266, "GiB IN ARC", colorBlue, 26, true)
+	total := "RAM UNKNOWN"
+	if s.Memory != nil {
+		total = fmt.Sprintf("%.0f GiB RAM", s.Memory.TotalGB)
+	}
+	detail := fmt.Sprintf("%s / %s / %s / up %s", s.TrueNASVersion, s.IPAddress, total, s.Uptime)
+	r.DrawText(img, 32, 323, ellipsize(r, detail, 896, 24, false), colorGray, 24, false)
+}
+
+func renderDrives(img *image.RGBA, r *display.TextRenderer, s *State) {
+	if s.Disks == nil {
+		renderMessage(img, r, "DRIVES UNAVAILABLE", "Drive inventory could not be read", colorYellow)
+		return
+	}
+	r.DrawText(img, 32, 92, "SATA", colorGray, 27, true)
+	present := 0
+	for _, slot := range s.Disks {
+		if slot.Present {
+			present++
+		}
+	}
+	summary := fmt.Sprintf("%d / 11 OCCUPIED", present)
+	r.DrawText(img, 928-r.MeasureText(summary, 25, true), 92, summary, colorGray, 25, true)
+	for i := 0; i < 6; i++ {
+		drawBay(img, r, s, findSlot(s.Disks, "sata", i+1), 32+i*150, 105, 138, 106)
+	}
+	r.DrawText(img, 32, 246, "NVMe", colorGray, 27, true)
+	for i := 0; i < 5; i++ {
+		drawBay(img, r, s, findSlot(s.Disks, "nvme", i+1), 32+i*180, 257, 168, 65)
+	}
+}
+
+func findSlot(slots []network.DiskSlot, kind string, bay int) network.DiskSlot {
+	for _, s := range slots {
+		if s.Kind == kind && s.Bay == bay {
+			return s
+		}
+	}
+	return network.DiskSlot{Kind: kind, Bay: bay}
+}
+
+func drawBay(img *image.RGBA, r *display.TextRenderer, s *State, slot network.DiskSlot, x, y, w, h int) {
+	c := colorLine
+	if slot.Present {
+		c = colorTeal
+	}
+	display.DrawFilledRect(img, x, y, w, h, c)
+	display.DrawFilledRect(img, x+2, y+2, w-4, h-4, colorBackground)
+	label := fmt.Sprint(slot.Bay)
+	if slot.Kind == "nvme" {
+		label = "N" + label
+	}
+	fg := colorMuted
+	if slot.Present {
+		fg = colorWhite
+	}
+	temp := "EMPTY"
+	if slot.Present {
+		temp = "--"
+		if v, ok := s.Temperatures.Disks[slot.Device]; ok {
+			temp = fmt.Sprintf("%.0f°C", v)
+		}
+	}
+	if slot.Kind == "sata" {
+		r.DrawText(img, x+(w-r.MeasureText(label, 44, true))/2, y+49, label, fg, 44, true)
+		r.DrawText(img, x+(w-r.MeasureText(temp, 26, false))/2, y+85, temp, fg, 26, false)
+	} else {
+		r.DrawText(img, x+12, y+42, label, fg, 29, true)
+		r.DrawText(img, x+w-r.MeasureText(temp, 24, false)-12, y+42, temp, fg, 24, false)
+	}
+}
+
+func renderMessage(img *image.RGBA, r *display.TextRenderer, title, detail string, c color.Color) {
+	display.DrawFilledRect(img, 32, 92, 5, 194, c)
+	drawFit(img, r, 64, 161, 832, title, c, 58, 38, true)
+	// Two measured lines preserve long notifications without shrinking the UI.
+	words := strings.Fields(detail)
+	line := ""
+	lines := []string{}
+	for _, word := range words {
+		next := strings.TrimSpace(line + " " + word)
+		if r.MeasureText(next, 34, false) > 830 && line != "" {
+			lines = append(lines, line)
+			line = word
+		} else {
+			line = next
+		}
+	}
+	if line != "" {
+		lines = append(lines, line)
+	}
+	for i, line := range lines {
+		if i == 2 {
+			break
+		}
+		if i == 1 && len(lines) > 2 {
+			line += " ..."
+		}
+		r.DrawText(img, 64, 222+i*47, ellipsize(r, line, 830, 34, false), colorWhite, 34, false)
+	}
+}
+
+func drawArrow(img *image.RGBA, x, y int, down bool, c color.Color) {
+	// Native geometry keeps glyph availability independent of the font.
+	for row := 0; row < 14; row++ {
+		w := 14 - row
+		if !down {
+			w = row + 1
+		}
+		display.DrawFilledRect(img, x-w, y+row, w*2, 1, c)
+	}
+}
+
+func drawFit(img *image.RGBA, r *display.TextRenderer, x, y, width int, text string, c color.Color, size, min float64, bold bool) {
+	for size > min && r.MeasureText(text, size, bold) > width {
+		size -= 2
+	}
+	r.DrawText(img, x, y, ellipsize(r, text, width, size, bold), c, size, bold)
+}
+
+func ellipsize(r *display.TextRenderer, text string, width int, size float64, bold bool) string {
+	if r.MeasureText(text, size, bold) <= width {
+		return text
+	}
+	runes := []rune(text)
+	for len(runes) > 0 {
+		runes = runes[:len(runes)-1]
+		s := string(runes) + "..."
+		if r.MeasureText(s, size, bold) <= width {
+			return s
+		}
+	}
+	return ""
 }

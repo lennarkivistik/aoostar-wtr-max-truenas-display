@@ -23,7 +23,7 @@ func ParseSchedule(offTime, onTime string) *Schedule {
 	offHour, offMin, err1 := parseTime(offTime)
 	onHour, onMin, err2 := parseTime(onTime)
 
-	if err1 != nil || err2 != nil {
+	if err1 != nil || err2 != nil || offTime == onTime {
 		fmt.Printf("Warning: Invalid time format. Use HH:MM (e.g., 22:00)\n")
 		return nil
 	}
@@ -38,12 +38,11 @@ func ParseSchedule(offTime, onTime string) *Schedule {
 
 // parseTime parses a HH:MM string into hour and minute.
 func parseTime(s string) (int, int, error) {
-	var hour, minute int
-	_, err := fmt.Sscanf(s, "%d:%d", &hour, &minute)
-	if err != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+	parsed, err := time.Parse("15:04", s)
+	if err != nil || parsed.Format("15:04") != s {
 		return 0, 0, fmt.Errorf("invalid time")
 	}
-	return hour, minute, nil
+	return parsed.Hour(), parsed.Minute(), nil
 }
 
 // IsNightMode checks if current time is within the off period.
@@ -61,4 +60,3 @@ func (s *Schedule) IsNightMode() bool {
 	// Crosses midnight: off 22:00, on 08:00 (off at night)
 	return currentMinutes >= offMinutes || currentMinutes < onMinutes
 }
-

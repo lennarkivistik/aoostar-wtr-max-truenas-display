@@ -7,9 +7,11 @@ package display
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"go.bug.st/serial"
+	"go.bug.st/serial/enumerator"
 )
 
 const (
@@ -43,6 +45,10 @@ type Display struct {
 	// Frame caching for differential updates
 	enableCache bool   // Whether to use frame caching (default: true)
 	prevFrame   []byte // Previous frame's RGB565 data for diff comparison
+
+	rgb565Buffer []byte
+	packetBuffer []byte
+	dirtyChunks  []int
 }
 
 // Open opens a connection to the display using the specified device path.
@@ -80,36 +86,40 @@ func FindAndOpen() (*Display, error) {
 }
 
 // FindAndOpenByID searches for a display with the specified USB VID:PID.
-// It first tries common device paths (/dev/ttyACM0, etc.) for faster detection,
-// then falls back to trying all available serial ports.
+// It only opens USB serial ports whose enumerated VID/PID matches.
 func FindAndOpenByID(vid, pid int) (*Display, error) {
-	ports, err := serial.GetPortsList()
+	ports, err := enumerator.GetDetailedPortsList()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list serial ports: %w", err)
+		return nil, fmt.Errorf("failed to list detailed serial ports: %w", err)
 	}
 
-	// Try common Linux device paths first for faster detection
-	commonPaths := []string{"/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0"}
-	for _, path := range commonPaths {
-		for _, port := range ports {
-			if port == path {
-				d, err := Open(path)
-				if err == nil {
-					return d, nil
-				}
-			}
-		}
-	}
+	wantVID := fmt.Sprintf("%04X", vid)
+	wantPID := fmt.Sprintf("%04X", pid)
+	var openErr error
 
-	// Fallback: try all available ports
 	for _, port := range ports {
-		d, err := Open(port)
+		if !matchesUSBVIDPID(port, wantVID, wantPID) {
+			continue
+		}
+		d, err := Open(port.Name)
 		if err == nil {
 			return d, nil
 		}
+		openErr = err
+	}
+
+	if openErr != nil {
+		return nil, fmt.Errorf("display with VID:PID %04x:%04x found but could not be opened: %w", vid, pid, openErr)
 	}
 
 	return nil, fmt.Errorf("display with VID:PID %04x:%04x not found", vid, pid)
+}
+
+func matchesUSBVIDPID(port *enumerator.PortDetails, wantVID, wantPID string) bool {
+	return port != nil &&
+		port.IsUSB &&
+		strings.EqualFold(port.VID, wantVID) &&
+		strings.EqualFold(port.PID, wantPID)
 }
 
 // Close closes the connection to the display

@@ -1,9 +1,7 @@
 package dashboard
 
 import (
-	"fmt"
 	"image"
-	"strings"
 	"sync"
 	"time"
 
@@ -41,36 +39,39 @@ type State struct {
 	TrueNASVersion string
 	IPAddress      string
 	Interface      string
+	LinkState      string
 	LinkSpeed      int
 	Uptime         string
 
-	// Displayed values (rolling average, updated every 1s for stable readability)
-	DisplayRxSpeed float64
-	DisplayTxSpeed float64
-	DisplayCPU     float64
+	// Displayed values (short exponential average, sampled once per second)
+	DisplayRxSpeed   float64
+	DisplayTxSpeed   float64
+	DisplayCPU       float64
+	CPUAvailable     bool
+	NetworkAvailable bool
+	ARC              *network.ARCInfo
+	Temperatures     network.Temperatures
 
 	// Hysteresis tracking for speed unit display (prevents flicker at boundaries)
 	LastRxUnit string
 	LastTxUnit string
 
-	// For rolling average calculation
-	RecentRx []float64
-	RecentTx []float64
-
 	// Slow-updating data (every 5s)
 	Memory *network.MemoryInfo
 	Pools  []network.ZFSPool
+	Disks  []network.DiskSlot
 
 	// Wave animation (packets that flow across the screen)
 	WaveAnimator *wave.Animator
 
-	// Alerts
-	Alerts []string
-
 	// Notification system
-	ActiveNotification *Notification      // Current notification to display (nil = none)
-	LoggedInUsers      []string           // Currently logged-in users (for red dot indicator)
-	ZFSStatus          *network.ZFSStatus // Current ZFS maintenance/health status
+	activeNotification   *Notification // Current notification to display (nil = none)
+	NotificationsChanged chan struct{} // Coalesced wakeups for prompt notifications.
+	notificationMutex    sync.RWMutex  // protects activeNotification across socket goroutines
+	LoggedInUsers        []string      // Current shell sessions
+	ZFSReadFailed        bool
+	PoolReadFailed       bool
+	ZFSStatus            *network.ZFSStatus // Current ZFS maintenance/health status
 
 	// Screenshot support
 	lastFrame  *image.RGBA // Last rendered frame (for screenshots)
@@ -80,119 +81,56 @@ type State struct {
 // NewState creates a new dashboard state.
 func NewState(iface string, animator *wave.Animator) *State {
 	return &State{
-		Interface:      iface,
-		TrueNASVersion: network.GetTrueNASVersion(),
-		WaveAnimator:   animator,
-		RecentRx:       make([]float64, 0, 10),
-		RecentTx:       make([]float64, 0, 10),
+		NotificationsChanged: make(chan struct{}, 1),
+		Interface:            iface,
+		TrueNASVersion:       network.GetTrueNASVersion(),
+		WaveAnimator:         animator,
 	}
 }
 
-// CheckAlerts evaluates system state and returns any active alerts.
-func (s *State) CheckAlerts() []string {
-	var alerts []string
-
-	// Check pool usage
-	for _, pool := range s.Pools {
-		if pool.UsedPercent >= 95 {
-			alerts = append(alerts, fmt.Sprintf("%s pool CRITICAL: %.0f%%", pool.Name, pool.UsedPercent))
-		} else if pool.UsedPercent >= 90 {
-			alerts = append(alerts, fmt.Sprintf("%s pool > 90%%", pool.Name))
-		}
+// SetActiveNotification replaces the active notification safely from any goroutine.
+func (s *State) SetActiveNotification(notif *Notification) {
+	s.notificationMutex.Lock()
+	defer s.notificationMutex.Unlock()
+	defer s.signalNotification()
+	if notif == nil {
+		s.activeNotification = nil
+		return
 	}
-
-	// Check if link is down
-	if s.LinkSpeed == 0 {
-		alerts = append(alerts, "No network link")
-	}
-
-	return alerts
+	cp := *notif
+	s.activeNotification = &cp
 }
 
-// Average calculates the average of a slice of float64.
-func Average(values []float64) float64 {
-	if len(values) == 0 {
-		return 0
+// GetActiveNotification returns a copy of the current notification.
+func (s *State) GetActiveNotification() *Notification {
+	s.notificationMutex.RLock()
+	defer s.notificationMutex.RUnlock()
+	if s.activeNotification == nil {
+		return nil
 	}
-	sum := 0.0
-	for _, v := range values {
-		sum += v
-	}
-	return sum / float64(len(values))
-}
-
-// UpdateNotificationFromZFS updates the active notification based on ZFS status.
-// Danger notifications (degraded pools, errors) take priority over warnings (maintenance).
-func (s *State) UpdateNotificationFromZFS() {
-	if s.ZFSStatus == nil {
-		return
-	}
-
-	// Priority 1: Degraded pools (danger - persistent)
-	if len(s.ZFSStatus.DegradedPools) > 0 {
-		s.ActiveNotification = &Notification{
-			Message: fmt.Sprintf("DEGRADED: %s", s.ZFSStatus.DegradedPools[0]),
-			Theme:   ThemeDanger,
-			// No expiry - persistent until resolved
-		}
-		return
-	}
-
-	// Priority 2: Disk errors (danger - persistent)
-	if s.ZFSStatus.ErrorCount > 0 {
-		s.ActiveNotification = &Notification{
-			Message: fmt.Sprintf("Disk errors detected: %d", s.ZFSStatus.ErrorCount),
-			Theme:   ThemeDanger,
-		}
-		return
-	}
-
-	// Priority 3: Resilver in progress (warning - persistent while active)
-	if s.ZFSStatus.ResilverInProgress {
-		msg := fmt.Sprintf("Resilver: %s", s.ZFSStatus.ActivePool)
-		if s.ZFSStatus.ScanProgress != "" {
-			msg += " " + s.ZFSStatus.ScanProgress
-		}
-		s.ActiveNotification = &Notification{
-			Message: msg,
-			Theme:   ThemeWarning,
-		}
-		return
-	}
-
-	// Priority 4: Scrub in progress (warning - persistent while active)
-	if s.ZFSStatus.ScrubInProgress {
-		msg := fmt.Sprintf("Scrub: %s", s.ZFSStatus.ActivePool)
-		if s.ZFSStatus.ScanProgress != "" {
-			msg += " " + s.ZFSStatus.ScanProgress
-		}
-		s.ActiveNotification = &Notification{
-			Message: msg,
-			Theme:   ThemeWarning,
-		}
-		return
-	}
-
-	// No ZFS issues - clear notification if it was ZFS-related
-	// (Don't clear if it's a different type of notification)
-	if s.ActiveNotification != nil {
-		msg := s.ActiveNotification.Message
-		if strings.Contains(msg, "Scrub") || strings.Contains(msg, "Resilver") ||
-			strings.Contains(msg, "DEGRADED") || strings.Contains(msg, "errors") {
-			s.ActiveNotification = nil
-		}
-	}
+	cp := *s.activeNotification
+	return &cp
 }
 
 // ClearExpiredNotification removes the active notification if it has expired.
 func (s *State) ClearExpiredNotification() {
-	if s.ActiveNotification != nil && s.ActiveNotification.IsExpired() {
-		s.ActiveNotification = nil
+	s.notificationMutex.Lock()
+	defer s.notificationMutex.Unlock()
+	if s.activeNotification != nil && s.activeNotification.IsExpired() {
+		s.activeNotification = nil
+		s.signalNotification()
 	}
 }
 
-// SetLastFrame stores a copy of the rendered frame for screenshot capture.
-// Copies the pixel data so the caller can safely reuse the source buffer.
+func (s *State) signalNotification() {
+	select {
+	case s.NotificationsChanged <- struct{}{}:
+	default:
+	}
+}
+
+// SetLastFrame stores the last completed frame for screenshot capture.
+// A reusable owned buffer keeps screenshots safe even after failed transfers.
 func (s *State) SetLastFrame(img *image.RGBA) {
 	s.frameMutex.Lock()
 	defer s.frameMutex.Unlock()

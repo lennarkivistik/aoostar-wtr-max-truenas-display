@@ -6,11 +6,8 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"time"
 )
-
-// Reusable RGB565 buffer for frame conversion (avoids allocation every frame)
-// Total size: 960 * 376 * 2 = 721,920 bytes
-var rgb565Buffer = make([]byte, Width*Height*2)
 
 const (
 	// ChunkSize is the number of RGB565 bytes sent per chunk.
@@ -30,6 +27,17 @@ var (
 	ChunkHeader = []byte{0xAA, 0x55, 0xAA, 0x55, 0x08, 0x00, 0x00, 0x00}
 )
 
+// FrameStats reports render-to-device transmission cost for one frame.
+type FrameStats struct {
+	ChangedChunks int
+	TotalChunks   int
+	BytesWritten  int
+	Writes        int
+	ConvertTime   time.Duration
+	DiffTime      time.Duration
+	SendTime      time.Duration
+}
+
 // RGBToRGB565 converts a 24-bit RGB888 color to 16-bit RGB565 format.
 // RGB565 packs colors as: RRRRRGGG GGGBBBBB (5 bits red, 6 bits green, 5 bits blue).
 // This halves memory usage compared to RGB888 while maintaining acceptable color depth.
@@ -40,11 +48,19 @@ func RGBToRGB565(r, g, b uint8) uint16 {
 // ImageToRGB565 converts a Go image.Image to a byte slice in RGB565 format.
 // The output is in little-endian byte order as required by the display.
 // Each pixel becomes 2 bytes, so the output size is width * height * 2.
-// OPTIMIZED: Uses direct pixel access and reusable buffer.
+// OPTIMIZED: Uses direct pixel access for RGBA images.
 func ImageToRGB565(img image.Image) []byte {
+	return imageToRGB565Into(img, nil)
+}
+
+func (d *Display) imageToRGB565(img image.Image) []byte {
+	return imageToRGB565Into(img, &d.rgb565Buffer)
+}
+
+func imageToRGB565Into(img image.Image, reusable *[]byte) []byte {
 	// Try to use fast path for RGBA images (most common case)
 	if rgba, ok := img.(*image.RGBA); ok {
-		return imageRGBAToRGB565(rgba)
+		return imageRGBAToRGB565Into(rgba, reusable)
 	}
 
 	// Fallback for other image types
@@ -52,12 +68,8 @@ func ImageToRGB565(img image.Image) []byte {
 	width := bounds.Dx()
 	height := bounds.Dy()
 
-	// Use reusable buffer if it fits, otherwise allocate
-	data := rgb565Buffer
 	neededSize := width * height * 2
-	if neededSize > len(data) {
-		data = make([]byte, neededSize)
-	}
+	data := ensureRGB565Buffer(reusable, neededSize)
 
 	// Convert each pixel row by row, left to right
 	for y := 0; y < height; y++ {
@@ -77,18 +89,18 @@ func ImageToRGB565(img image.Image) []byte {
 // imageRGBAToRGB565 is the fast path for RGBA images.
 // Uses direct slice access (~10x faster than img.At()).
 func imageRGBAToRGB565(img *image.RGBA) []byte {
+	return imageRGBAToRGB565Into(img, nil)
+}
+
+func imageRGBAToRGB565Into(img *image.RGBA, reusable *[]byte) []byte {
 	bounds := img.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
 	stride := img.Stride
 	pix := img.Pix
 
-	// Use reusable buffer
-	data := rgb565Buffer
 	neededSize := width * height * 2
-	if neededSize > len(data) {
-		data = make([]byte, neededSize)
-	}
+	data := ensureRGB565Buffer(reusable, neededSize)
 
 	// Direct pixel access: img.Pix is [R, G, B, A, R, G, B, A, ...]
 	// Each row starts at y*stride, each pixel is 4 bytes
@@ -112,6 +124,16 @@ func imageRGBAToRGB565(img *image.RGBA) []byte {
 	return data[:neededSize]
 }
 
+func ensureRGB565Buffer(reusable *[]byte, neededSize int) []byte {
+	if reusable == nil {
+		return make([]byte, neededSize)
+	}
+	if cap(*reusable) < neededSize {
+		*reusable = make([]byte, neededSize)
+	}
+	return (*reusable)[:neededSize]
+}
+
 // SendImage converts and transmits an image to the display.
 //
 // The transmission protocol works as follows:
@@ -123,48 +145,49 @@ func imageRGBAToRGB565(img *image.RGBA) []byte {
 // This dramatically speeds up partial screen updates (e.g., number changes).
 // A full 960x376 image has 15,360 chunks, but typical dashboard updates
 // only change ~500-2000 chunks, making updates 5-10x faster.
-func (d *Display) SendImage(img image.Image) error {
-	// Convert image to RGB565 format
-	rgb565Data := ImageToRGB565(img)
+func (d *Display) SendImage(img image.Image) (FrameStats, error) {
+	var stats FrameStats
 
-	// Signal start of image transfer
-	if err := d.send(CmdImageStart); err != nil {
-		return fmt.Errorf("failed to send image start: %w", err)
+	// Convert image to RGB565 format
+	convertStart := time.Now()
+	rgb565Data := d.imageToRGB565(img)
+	stats.ConvertTime = time.Since(convertStart)
+
+	diffStart := time.Now()
+	dirtyChunks := d.findDirtyChunks(rgb565Data)
+	stats.DiffTime = time.Since(diffStart)
+	stats.ChangedChunks = len(dirtyChunks)
+	stats.TotalChunks = chunkCount(len(rgb565Data))
+
+	if d.enableCache && d.prevFrame != nil && len(dirtyChunks) == 0 {
+		return stats, nil
 	}
 
-	// Reusable packet buffer to reduce allocations
-	packet := make([]byte, len(ChunkHeader)+4+ChunkSize)
-	copy(packet, ChunkHeader)
+	sendStart := time.Now()
+
+	if err := d.sendCounted(CmdImageStart, &stats); err != nil {
+		return stats, fmt.Errorf("failed to send image start: %w", err)
+	}
 
 	// Send image data in chunks (with optional differential updates)
 	// Each chunk: [8-byte header] [4-byte offset LE] [47 bytes RGB565 data]
-	for offset := 0; offset < len(rgb565Data); offset += ChunkSize {
+	for _, offset := range dirtyChunks {
 		end := offset + ChunkSize
 		if end > len(rgb565Data) {
 			end = len(rgb565Data)
 		}
 		chunk := rgb565Data[offset:end]
 
-		// Skip unchanged chunks if caching is enabled
-		if d.enableCache && d.prevFrame != nil {
-			if end <= len(d.prevFrame) && chunksEqual(d.prevFrame[offset:end], chunk) {
-				continue // Skip - this chunk hasn't changed
-			}
-		}
-
-		// Build chunk packet (reusing buffer)
-		binary.LittleEndian.PutUint32(packet[len(ChunkHeader):], uint32(offset))
-		copy(packet[len(ChunkHeader)+4:], chunk)
-
-		if err := d.send(packet[:len(ChunkHeader)+4+len(chunk)]); err != nil {
-			return fmt.Errorf("failed to send chunk at offset %d: %w", offset, err)
+		if err := d.sendChunkPacket(offset, chunk, &stats); err != nil {
+			return stats, fmt.Errorf("failed to send chunk at offset %d: %w", offset, err)
 		}
 	}
 
 	// Signal end of transfer - this triggers the display to show the new image
-	if err := d.sendAndDrain(CmdImageEnd); err != nil {
-		return fmt.Errorf("failed to send image end: %w", err)
+	if err := d.sendAndDrainCounted(CmdImageEnd, &stats); err != nil {
+		return stats, fmt.Errorf("failed to send image end: %w", err)
 	}
+	stats.SendTime = time.Since(sendStart)
 
 	// Cache current frame for next comparison
 	if d.enableCache {
@@ -174,6 +197,69 @@ func (d *Display) SendImage(img image.Image) error {
 		copy(d.prevFrame, rgb565Data)
 	}
 
+	return stats, nil
+}
+
+func chunkCount(byteLen int) int {
+	if byteLen == 0 {
+		return 0
+	}
+	return (byteLen + ChunkSize - 1) / ChunkSize
+}
+
+func (d *Display) findDirtyChunks(rgb565Data []byte) []int {
+	d.dirtyChunks = d.dirtyChunks[:0]
+	for offset := 0; offset < len(rgb565Data); offset += ChunkSize {
+		end := offset + ChunkSize
+		if end > len(rgb565Data) {
+			end = len(rgb565Data)
+		}
+
+		if d.enableCache && d.prevFrame != nil && end <= len(d.prevFrame) &&
+			chunksEqual(d.prevFrame[offset:end], rgb565Data[offset:end]) {
+			continue
+		}
+
+		d.dirtyChunks = append(d.dirtyChunks, offset)
+	}
+	return d.dirtyChunks
+}
+
+func (d *Display) sendChunkPacket(offset int, chunk []byte, stats *FrameStats) error {
+	packetLen := len(ChunkHeader) + 4 + len(chunk)
+	if cap(d.packetBuffer) < packetLen {
+		d.packetBuffer = make([]byte, len(ChunkHeader)+4+ChunkSize)
+	}
+	packet := d.packetBuffer[:packetLen]
+	copy(packet, ChunkHeader)
+	binary.LittleEndian.PutUint32(packet[len(ChunkHeader):], uint32(offset))
+	copy(packet[len(ChunkHeader)+4:], chunk)
+
+	return d.sendCounted(packet, stats)
+}
+
+func (d *Display) sendCounted(data []byte, stats *FrameStats) error {
+	if err := d.send(data); err != nil {
+		return err
+	}
+	stats.BytesWritten += len(data)
+	stats.Writes++
+	return nil
+}
+
+func (d *Display) sendAndDrainCounted(data []byte, stats *FrameStats) error {
+	if err := d.sendCounted(data, stats); err != nil {
+		return err
+	}
+	for i := 0; i < 3; i++ {
+		if err := d.port.Drain(); err != nil {
+			if i < 2 {
+				continue
+			}
+			return fmt.Errorf("failed to drain port: %w", err)
+		}
+		break
+	}
 	return nil
 }
 

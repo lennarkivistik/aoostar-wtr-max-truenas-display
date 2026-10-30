@@ -1,103 +1,85 @@
-# Development Guide
+# Development
 
-This document describes the architecture and coding conventions for the `wtr-display` project.
+## Components
 
-## Project Structure
+- `main.go`: validated CLI, lifecycle, sampling, schedules and render cadence.
+- `dashboard/options.go`: fixed selection and monotonic-time playlist rotation.
+- `dashboard/render.go`: four views and cached displayed-value keys.
+- `dashboard/health.go`: measured health and critical alert precedence.
+- `dashboard/notify.go`: bounded local socket notifications and screenshots.
+- `network/`: Linux/ZFS data collection and parsing.
+- `wave/animator.go`: bounded timestamped history and elapsed-time scaling.
+- `display/`: text/geometry, RGB565 conversion and compatible serial transfers.
 
-The project follows a modular architecture to separate concerns between hardware drivers, data monitoring, rendering logic, and application orchestration.
+## Rendering
 
+One goroutine owns state and rendering. A reusable base image contains all
+non-animated content. Keys use displayed precision and view-specific fields;
+hidden CPU changes cannot invalidate a storage page. A settled unchanged frame
+returns before pixel copying, conversion or transmission. The network page adds
+two smoothstep curves; interpolation cannot overshoot adjacent observations.
+Colored fills use straight alpha converted once per curve. Wave point arrays,
+RGB565 data and packet buffers are reused.
+
+A completed successful transfer is copied into one reusable screenshot buffer
+under a mutex. Screenshot requests clone that buffer. Failed transfers invalidate
+the device cache and cannot publish a misleading successful screenshot.
+
+Rendering profiles request 1/4/8 FPS. CPU and measured partial-transfer duration
+can reduce the rate. Full-page transitions do not permanently set the animation
+budget. Critical changes, notifications and page changes can wake the renderer
+independently of manual timing. No animation is performed for hidden views.
+
+## Data cadence
+
+| Source | Cadence |
+|---|---|
+| Network counters, CPU, operstate | 1 second while awake |
+| Memory, ARC, kernel temperatures | 5 seconds while awake |
+| IP, link speed, uptime | 30 seconds while awake |
+| Shell sessions | 10 seconds |
+| Pool capacity, drive inventory, ZFS health | 60 seconds, one sequential worker |
+| Night schedule | 60 seconds |
+
+ZFS/lsblk commands have two-second timeouts and run outside the render loop.
+Temperature data comes from hwmon; no repeated SMART subprocesses or disk scans
+are introduced. Physical slots map by PCI/by-path topology, not kernel sdX order.
+This mapping is specific to the WTR MAX and should be verified on other hardware.
+
+Unavailable reads are distinct from empty or healthy results. A failed health
+refresh retains known critical faults, labelled as last known. Link operstate is
+separate from speed metadata. Counter resets establish a new network baseline.
+CPU and memory reads do not attempt to infer ZFS ARC health from RAM usage.
+
+## Checks
+
+`go test -race ./...`, `go vet ./...`, and a Linux amd64 build are required.
+`go run . --preview build/previews` generates deterministic layout fixtures.
+Inspect network, storage, system, drives, fault and unavailable images. Use
+`go test ./dashboard ./display -run '^$' -bench . -benchmem` for local timing.
+Hardware transfer and physical readability must be checked separately.
+
+## Demo media
+
+The README uses the same native renderer as the display, with synthetic data and
+an RFC 5737 documentation address. No NAS connection is needed. Regenerate it
+with Go and FFmpeg:
+
+```sh
+go run . --preview docs/previews
+go run ./cmd/showcase -out build/showcase
+ffmpeg -y -framerate 4 -i build/showcase/%03d.png -filter_complex \
+  '[0:v]split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle' \
+  -loop 0 docs/showcase.gif
 ```
-go-wtr-display/
-├── main.go                 # CLI entry point and main loop
-├── build.sh                # Cross-compilation script
-├── dashboard/
-│   ├── auto.go             # Smart Auto Mode (FPS/Power scaling)
-│   ├── notify.go           # Unix socket notification server
-│   ├── render.go           # UI compositing and layout
-│   ├── scheduler.go        # Night mode scheduling
-│   └── state.go            # Dashboard state, frame storage
-├── display/
-│   ├── display.go          # Serial port communication and protocol
-│   ├── gauge.go            # Arc gauge rendering
-│   ├── image.go            # RGB565 conversion and image transmission
-│   ├── shapes.go           # Rectangles, circles, rounded rects
-│   ├── text.go             # Font rendering with Go fonts
-│   └── wave.go             # Wave/sparkline visualization
-├── network/
-│   ├── history.go          # Network stats history (ring buffer)
-│   ├── stats.go            # Network throughput monitoring
-│   └── system.go           # CPU, memory, ZFS, login detection (utmp)
-├── wave/
-│   └── animator.go         # Wave animation state machine
-└── docs/
-    ├── DESIGN.md            # UI/UX design concepts and color palette
-    ├── DEVELOPMENT.md       # Architecture and coding conventions
-    └── screenshot.png       # Display screenshot
-```
 
-## Architecture Overview
+The tour shows rotating pages, a fixed live network page, line-only waves and a
+critical fault. It is a presentation fixture, not a hardware performance test.
 
-### 1. Rendering Loop
-The application uses a **Layered Rendering** approach to minimize CPU usage:
--   **Static Layer (`bgImg`)**: Contains elements that update slowly (Background, Header, Gauges, Labels). Updated every 5s-30s.
--   **Dynamic Layer**: Contains elements that update rapidly (Waveform, Speed Numbers). Updated at 4-15 FPS.
+## Releases
 
-On every animation frame:
-1.  `display.CopyImage(frame, bgImg)`: Fast `copy(dst.Pix, src.Pix)` of the static background.
-2.  Draw Waveform on top (uses `display.WavePoint` directly from `wave.Animator`).
-3.  Draw Speed Numbers on top (with unit hysteresis to prevent flicker at boundaries).
-4.  `state.SetLastFrame(frame)`: Bulk copy of pixel data for thread-safe screenshots.
-5.  Send `frame` to display via USB.
-
-### 2. Auto Mode
-The `--auto` flag enables smart resource management:
--   **Idle**: Low traffic/load → Low FPS (4) to save CPU.
--   **Active**: High traffic → High FPS (15) for smooth visuals.
--   **Heavy Load**: High CPU usage → Min FPS (1) to prioritize system tasks.
--   **Night Mode**: Automatically turns off display between 23:00 and 10:00.
-
-## Coding Conventions
-
-### Performance
-This app runs on a NAS/Router, so efficiency is critical.
-*   **Avoid Allocations in Loop**: Do not allocate slices or huge structs inside the render loop (`RenderAndSend`). Use pre-allocated buffers.
-*   **Direct Pixel Access**: Use `copy(dst.Pix, src.Pix)` for bulk image operations instead of per-pixel `Set()`/`At()`. Use optimized drawing functions (e.g., `drawVerticalLineAlpha`) for heavy operations like filling waves.
-*   **Unify Types Across Packages**: Avoid creating duplicate structs in different packages that require per-frame conversion. Shared types live in `display/` and are imported by other packages.
-*   **Prefer File Reads Over Exec**: Where possible, read system files directly (e.g., `/var/run/utmp` for login detection) instead of spawning processes. Process spawns are expensive relative to file reads.
-*   **Thread-Safe Frame Storage**: `SetLastFrame` copies pixel data rather than storing a reference to the caller's buffer. This prevents partially-drawn frames from appearing in screenshots.
-*   **Font Caching**: `TextRenderer` caches font faces. Reuse the renderer instance.
-
-### Threading
-*   **Single-Threaded Rendering**: The render loop is single-threaded. Multithreading adds overhead for 960x376 pixels.
-*   **Tickers**: Use separate `time.Ticker` for data sampling (1s) and rendering (variable).
-
-### Style
-*   **Keep `main.go` Clean**: Put logic in `dashboard/` subpackages. `main.go` should only handle wiring and the main `select` loop.
-*   **Explicit State**: Pass `*State` structs rather than using globals.
-
-## Data Sources
-
-All data is gathered non-invasively:
-
-| Data | Source | Interval | Impact |
-|------|--------|----------|--------|
-| CPU Usage | `/proc/stat` | 1s | None (file read) |
-| Memory | `/proc/meminfo` | 5s | None (file read) |
-| Network Stats | `/sys/class/net/<iface>/statistics/` | 1s | None (file read) |
-| ZFS Pools | `zpool list` command | 5s | Minimal (~10ms) |
-| ZFS Status | `zpool status` command | 60s | Minimal (~20ms) |
-| Logged-in Users | `/var/run/utmp` | 10s | None (file read) |
-| TrueNAS Version | `/etc/version` or `/etc/os-release` | Once | None (file read) |
-| IP Address | Go `net` package | 30s | None (syscall) |
-| Link Speed | `/sys/class/net/<iface>/speed` | 30s | None (file read) |
-| Uptime | `/proc/uptime` | 30s | None (file read) |
-
-## Protocol Details
-
-The display uses a proprietary protocol over USB serial:
-
-- **Baud Rate**: 1,500,000 (ignored, USB bulk transfer)
-- **Display On**: `AA 55 AA 55 0B 00 00 00`
-- **Display Off**: `AA 55 AA 55 0A 00 00 00`
-- **Image Format**: RGB565, sent in 47-byte chunks with offset headers
-
+Main and pull requests run tests, race checks, vet and a Linux build. An explicit
+`vMAJOR.MINOR.PATCH` tag runs the same checks and publishes the Linux amd64 binary
+and SHA-256 checksum. Main pushes do not invent version numbers. Build artifacts
+use `-trimpath` so developer filesystem paths are not embedded. Keep sample data
+synthetic; do not commit deployment scripts, device logs or live data captures.

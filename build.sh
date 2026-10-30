@@ -37,7 +37,7 @@ if [[ "$GOARCH" == "mips64le" || "$GOARCH" == "mips64" ]]; then
 fi
 
 # Build the binary with version information
-go build -o "$BUILD_DIR/$OUTPUT_NAME" -ldflags "-X main.version=$VERSION" .
+go build -trimpath -o "$BUILD_DIR/$OUTPUT_NAME" -ldflags "-X main.version=$VERSION" .
 
 echo "Built $OUTPUT_NAME for $GOOS/$GOARCH at $BUILD_DIR/$OUTPUT_NAME"
 

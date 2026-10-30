@@ -1,58 +1,52 @@
-name: Build and Release
+name: Check and Release
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
-  build-and-release:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: ./build.sh linux amd64 ci
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          fetch-depth: 0  # Fetch all history for tags
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-          check-latest: true
-
-      - name: Get next version
-        id: version
-        run: |
-          # Get the latest tag, default to v0.0.0 if none exists
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          echo "Latest tag: $LATEST_TAG"
-          
-          # Parse version components (remove 'v' prefix)
-          VERSION=${LATEST_TAG#v}
-          MAJOR=$(echo $VERSION | cut -d. -f1)
-          MINOR=$(echo $VERSION | cut -d. -f2)
-          PATCH=$(echo $VERSION | cut -d. -f3)
-          
-          # Increment patch version
-          PATCH=$((PATCH + 1))
-          
-          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
-          echo "New version: $NEW_VERSION"
-          echo "VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
-
-      - name: Build binary
-        run: |
-          chmod +x build.sh
-          ./build.sh linux amd64 ${{ steps.version.outputs.VERSION }}
-
-      - name: Create Release
+          go-version: stable
+      - name: Build release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
         run: |
-          gh release create ${{ steps.version.outputs.VERSION }} \
-            --title "Release ${{ steps.version.outputs.VERSION }}" \
-            --generate-notes \
-            ./build/linux-amd64/*
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          ./build.sh linux amd64 "$VERSION"
+          cd build/linux-amd64
+          sha256sum "wtr-display-linux-amd64-$VERSION" > SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          gh release create "$VERSION" --verify-tag \
+            --title "WTR Display $VERSION" --notes-file docs/RELEASE-NOTES.md \
+            "build/linux-amd64/wtr-display-linux-amd64-$VERSION" \
+            build/linux-amd64/SHA256SUMS

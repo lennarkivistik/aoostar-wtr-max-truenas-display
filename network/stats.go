@@ -88,23 +88,20 @@ func (m *Monitor) GetThroughput() (*Throughput, error) {
 		return nil, err
 	}
 
-	if m.prevStats == nil {
-		m.prevStats = current
-		return &Throughput{}, nil
-	}
-
-	elapsed := current.Time.Sub(m.prevStats.Time).Seconds()
-	if elapsed <= 0 {
-		return &Throughput{}, nil
-	}
-
-	throughput := &Throughput{
-		RxBytesPerSec: float64(current.RxBytes-m.prevStats.RxBytes) / elapsed,
-		TxBytesPerSec: float64(current.TxBytes-m.prevStats.TxBytes) / elapsed,
-	}
-
+	throughput := throughputBetween(current, m.prevStats)
 	m.prevStats = current
 	return throughput, nil
+}
+
+func throughputBetween(current, previous *Stats) *Throughput {
+	if previous == nil || current.RxBytes < previous.RxBytes || current.TxBytes < previous.TxBytes {
+		return &Throughput{}
+	}
+	elapsed := current.Time.Sub(previous.Time).Seconds()
+	if elapsed <= 0 {
+		return &Throughput{}
+	}
+	return &Throughput{RxBytesPerSec: float64(current.RxBytes-previous.RxBytes) / elapsed, TxBytesPerSec: float64(current.TxBytes-previous.TxBytes) / elapsed}
 }
 
 func (m *Monitor) readStat(stat string) (uint64, error) {
@@ -240,4 +237,3 @@ func FormatBits(bytesPerSec float64) string {
 		return fmt.Sprintf("%.0f bps", bitsPerSec)
 	}
 }
-

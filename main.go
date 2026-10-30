@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"image/color"
+	"math"
 	"os"
 	"os/signal"
 	"syscall"
@@ -25,10 +28,10 @@ func main() {
 	iface := flag.String("iface", "", "Network interface to monitor (e.g., eth0)")
 	listIfaces := flag.Bool("list-ifaces", false, "List available network interfaces")
 	showVersion := flag.Bool("version", false, "Show version and exit")
-	samples := flag.Int("samples", 5, "Number of samples for sparkline history (default: 5)")
+	samples := flag.Int("samples", 20, "Legacy alias for wave-history in seconds (5-300)")
 	waveFps := flag.Int("wave-fps", 4, "Sparkline animation FPS (default: 4)")
 	frameInterval := flag.String("frame-interval", "", "Override update interval (e.g. 5s, 500ms). Takes precedence over wave-fps.")
-	autoMode := flag.Bool("auto", false, "Enable smart auto-scaling FPS (based on load/traffic) and default night mode (23:00-10:00)")
+	autoMode := flag.Bool("auto", false, "Legacy automatic night schedule (23:00-10:00); profiles always manage rendering cost")
 	noCache := flag.Bool("no-cache", false, "Disable frame caching (sends full frames)")
 	offTime := flag.String("off-time", "", "Time to turn display off (HH:MM, e.g., 22:00)")
 	onTime := flag.String("on-time", "", "Time to turn display on (HH:MM, e.g., 08:00)")
@@ -40,8 +43,84 @@ func main() {
 
 	// Screenshot flag (requests from running instance)
 	screenshot := flag.String("screenshot", "", "Save screenshot from running display to file (PNG)")
+	benchDisplay := flag.String("bench-display", "", "Benchmark display updates: full, dirty, noop")
+	benchFrames := flag.Int("bench-frames", 20, "Number of frames for --bench-display")
+	benchJSON := flag.Bool("bench-json", false, "Output --bench-display results as JSON")
+
+	fixedView := flag.String("view", "", "Pin one live view: network, storage, system, drives")
+	views := flag.String("views", "network,storage,system,drives", "Ordered rotating views (comma-separated)")
+	dwell := flag.Duration("view-duration", 10*time.Second, "Time per rotating page (3s-1h)")
+	pool := flag.String("pool", "", "Storage pool to display (default: all in rotation, first when fixed)")
+	profile := flag.String("profile", "balanced", "Resource profile: eco, balanced, smooth")
+	waveStyle := flag.String("wave-style", "filled", "Wave appearance: filled, line, off")
+	waveHistory := flag.Duration("wave-history", 20*time.Second, "Visible network history (5s-5m)")
+	waveScale := flag.String("wave-scale", "adaptive", "Wave scale: adaptive or link")
+	nightMode := flag.String("night-mode", "auto", "Night schedule: auto (legacy --auto or explicit times), on, off")
+	preview := flag.String("preview", "", "Write demo PNGs for every view to this directory; no device required")
 
 	flag.Parse()
+	providedFlags := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		providedFlags[f.Name] = true
+	})
+
+	options := dashboard.DefaultOptions()
+	if providedFlags["view"] && providedFlags["views"] {
+		fatal(fmt.Errorf("use --view or --views, not both"))
+	}
+	if err := options.SetViews(*fixedView, *views); err != nil {
+		fatal(err)
+	}
+	options.Dwell, options.Pool, options.Profile = *dwell, *pool, *profile
+	options.WaveStyle, options.WaveHistory, options.WaveScale = *waveStyle, *waveHistory, *waveScale
+	if providedFlags["samples"] && !providedFlags["wave-history"] {
+		if *samples < 5 || *samples > 300 {
+			fatal(fmt.Errorf("samples must be between 5 and 300"))
+		}
+		options.WaveHistory = time.Duration(*samples) * time.Second
+	}
+	if *frameInterval != "" {
+		interval, err := time.ParseDuration(*frameInterval)
+		if err != nil || interval <= 0 {
+			fatal(fmt.Errorf("frame-interval must be a positive duration"))
+		}
+		options.FrameInterval = interval
+	} else if providedFlags["wave-fps"] {
+		if *waveFps < 1 || *waveFps > 10 {
+			fatal(fmt.Errorf("wave-fps must be between 1 and 10"))
+		}
+		options.FrameInterval = time.Second / time.Duration(*waveFps)
+	}
+	if err := options.Validate(); err != nil {
+		fatal(err)
+	}
+	if *nightMode != "auto" && *nightMode != "on" && *nightMode != "off" {
+		fatal(fmt.Errorf("night-mode must be auto, on, or off"))
+	}
+	var schedule *dashboard.Schedule
+	if *nightMode != "off" {
+		if *autoMode || *nightMode == "on" {
+			if *offTime == "" {
+				*offTime = "23:00"
+			}
+			if *onTime == "" {
+				*onTime = "10:00"
+			}
+		}
+		if *offTime != "" || *onTime != "" {
+			schedule = dashboard.ParseSchedule(*offTime, *onTime)
+			if schedule == nil {
+				fatal(fmt.Errorf("supply valid, different off-time and on-time in HH:MM format"))
+			}
+		}
+	}
+	if *preview != "" {
+		if err := dashboard.WritePreviews(*preview, options); err != nil {
+			fatal(err)
+		}
+		fmt.Printf("Demo previews saved to %s\n", *preview)
+		return
+	}
 
 	// Handle notification sending (client mode)
 	if *notify != "" {
@@ -81,36 +160,15 @@ func main() {
 		return
 	}
 
-	hasAction := *on || *off || *iface != ""
+	hasAction := *on || *off || *iface != "" || *benchDisplay != ""
 	if !hasAction {
-		fmt.Println("WTR Display - TrueNAS Dashboard")
-		fmt.Println("\nUsage: wtr-display [options]")
-		fmt.Println("\nCommands:")
-		fmt.Println("  --on                Turn display on")
-		fmt.Println("  --off               Turn display off")
-		fmt.Println("  --iface eth0        Monitor network interface")
-		fmt.Println("  --list-ifaces       List available interfaces")
-		fmt.Println("\nNotifications (send to running instance):")
-		fmt.Println("  --notify \"message\"  Send notification to display")
-		fmt.Println("  --notify-type TYPE  Type: info, warning, danger (default: info)")
-		fmt.Println("  --notify-duration N Duration in seconds (default: 10, 0=persistent)")
-		fmt.Println("\nScreenshot:")
-		fmt.Println("  --screenshot FILE   Save screenshot from running display (PNG)")
-		fmt.Println("\nOptions:")
-		fmt.Println("  --wave-fps N        Sparkline animation FPS (default: 4)")
-		fmt.Println("  --samples N         Sparkline history samples (default: 5)")
-		fmt.Println("  --auto              Auto Mode (Smart FPS + Night Mode)")
-		fmt.Println("  --off-time HH:MM    Night mode start (e.g., 22:00)")
-		fmt.Println("  --on-time HH:MM     Night mode end (e.g., 08:00)")
-		fmt.Println("  --no-cache          Disable frame caching (slower)")
-		fmt.Println("\nExamples:")
-		fmt.Println("  wtr-display --iface eth0")
-		fmt.Println("  wtr-display --notify \"Backup complete\" --notify-type info")
-		fmt.Println("  wtr-display --notify \"Drive failure!\" --notify-type danger --notify-duration 0")
-		fmt.Println("  wtr-display --screenshot /tmp/display.png")
-		fmt.Println("\nFlags:")
+		fmt.Println("WTR Display - rotating and fixed TrueNAS views")
+		fmt.Println("Rotate: wtr-display --iface eth0")
+		fmt.Println("Fixed:  wtr-display --iface eth0 --view network")
+		fmt.Println("Pool:   wtr-display --iface eth0 --view storage --pool tank")
+		fmt.Println("Demo:   wtr-display --preview ./previews")
 		flag.PrintDefaults()
-		os.Exit(1)
+		return
 	}
 
 	// Open display
@@ -118,10 +176,10 @@ func main() {
 	var err error
 
 	if *device != "" {
-		fmt.Printf("Opening device: %s\n", *device)
+		fmt.Fprintf(os.Stderr, "Opening device: %s\n", *device)
 		d, err = display.Open(*device)
 	} else {
-		fmt.Println("Auto-detecting display...")
+		fmt.Fprintln(os.Stderr, "Auto-detecting display...")
 		d, err = display.FindAndOpen()
 	}
 
@@ -151,239 +209,349 @@ func main() {
 		return
 	}
 
+	if *benchDisplay != "" {
+		if *benchFrames <= 0 {
+			fmt.Println("Error: bench-frames must be > 0")
+			os.Exit(1)
+		}
+		if err := runDisplayBenchmark(d, *benchDisplay, *benchFrames, *benchJSON); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *iface != "" {
-		fmt.Printf("Starting dashboard for interface: %s\n", *iface)
 		if *noCache {
 			d.SetCacheEnabled(false)
-			fmt.Println("Frame caching disabled (full frame updates)")
 		}
-
-		// Parse schedule times
-		if *autoMode {
-			if *offTime == "" {
-				*offTime = "23:00"
-			}
-			if *onTime == "" {
-				*onTime = "10:00"
-			}
-			fmt.Printf("Auto Mode: Default schedule enabled (Off %s, On %s)\n", *offTime, *onTime)
+		if err := runDashboard(d, *iface, options, schedule); err != nil {
+			fatal(err)
 		}
-
-		schedule := dashboard.ParseSchedule(*offTime, *onTime)
-		if schedule != nil {
-			fmt.Printf("Night mode: display off %s, on %s\n", *offTime, *onTime)
-			now := time.Now()
-			fmt.Printf("Current system time: %s\n", now.Format("15:04:05"))
-			if schedule.IsNightMode() {
-				fmt.Println("Status: Inside night mode window (should be OFF)")
-			} else {
-				fmt.Println("Status: Outside night mode window (should be ON)")
-			}
-		}
-
-		// Calculate initial animation interval
-		var animDuration time.Duration
-		if *frameInterval != "" {
-			var err error
-			animDuration, err = time.ParseDuration(*frameInterval)
-			if err != nil {
-				fmt.Printf("Error parsing frame-interval: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("Update interval set to %v\n", animDuration)
-		} else {
-			if *waveFps <= 0 {
-				fmt.Println("Error: wave-fps must be > 0")
-				os.Exit(1)
-			}
-			animDuration = time.Second / time.Duration(*waveFps)
-		}
-
-		runDashboard(d, *iface, *samples, animDuration, schedule, *autoMode)
 	}
 }
 
-func runDashboard(d *display.Display, iface string, samples int, animDuration time.Duration, schedule *dashboard.Schedule, autoMode bool) {
-	// Initialize wave animator
-	animator := wave.NewAnimator(samples)
+func fatal(err error) { fmt.Fprintln(os.Stderr, "Error:", err); os.Exit(1) }
 
-	// Initialize state
+type storageSnapshot struct {
+	pools []network.ZFSPool
+	disks []network.DiskSlot
+	zfs   *network.ZFSStatus
+}
+
+func runDashboard(d *display.Display, iface string, options dashboard.Options, schedule *dashboard.Schedule) error {
+	animator := wave.NewAnimatorWithHistory(options.WaveHistory)
 	state := dashboard.NewState(iface, animator)
-
-	// Start notification server (for external --notify commands)
 	notifyServer, err := dashboard.NewNotifyServer(state)
 	if err != nil {
-		fmt.Printf("Warning: notification server failed to start: %v\n", err)
-	} else {
-		notifyServer.Start()
-		defer notifyServer.Stop()
-		fmt.Printf("Notification socket: %s\n", dashboard.DefaultSocketPath)
+		return err
 	}
+	notifyServer.Start()
+	defer notifyServer.Stop()
+	fmt.Printf("Views: %v | fixed: %t | profile: %s | socket: %s\n", options.Views, options.Fixed, options.Profile, dashboard.DefaultSocketPath)
 
-	// Reusable image buffers
-	bgImg := display.NewDisplayImage()
-	img := display.NewDisplayImage()
-
-	// Renderer
-	renderer := display.NewTextRenderer()
-
-	// Monitors
 	netMonitor := network.NewMonitor(iface)
 	cpuMonitor := network.NewCPUMonitor()
-
-	// Initial fetch
-	state.IPAddress, _ = network.GetInterfaceIP(iface)
-	state.LinkSpeed = network.GetLinkSpeed(iface)
-	state.Uptime = network.GetUptime()
-	state.Memory = network.GetMemoryInfo()
-	state.Pools = network.GetZFSPools()
-
-	// Render static layer
-	dashboard.RenderStaticLayer(bgImg, renderer, state)
-
-	fmt.Printf("TrueNAS: %s | IP: %s | Link: %s\n",
-		state.TrueNASVersion, state.IPAddress, network.FormatLinkSpeed(state.LinkSpeed))
-
-	// Signal handling
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Tickers
-	sampleTicker := time.NewTicker(1 * time.Second)
-	slowTicker := time.NewTicker(5 * time.Second)
-	staticTicker := time.NewTicker(30 * time.Second)
-	scheduleTicker := time.NewTicker(1 * time.Minute)
-	loginTicker := time.NewTicker(10 * time.Second) // Check logged-in users
-	zfsTicker := time.NewTicker(60 * time.Second)   // Check ZFS status
-	defer sampleTicker.Stop()
-	defer slowTicker.Stop()
-	defer staticTicker.Stop()
-	defer scheduleTicker.Stop()
-	defer loginTicker.Stop()
-	defer zfsTicker.Stop()
-
-	// Animation ticker
-	animTicker := time.NewTicker(animDuration)
-	defer animTicker.Stop()
-
-	// Initial baseline
+	refreshIdentity := func() {
+		state.IPAddress, _ = network.GetInterfaceIP(iface)
+		state.LinkSpeed = network.GetLinkSpeed(iface)
+		state.LinkState = network.GetLinkState(iface)
+		state.Uptime = network.GetUptime()
+	}
+	refreshSystem := func() {
+		state.Memory = network.GetMemoryInfo()
+		state.ARC = network.GetARCInfo()
+		state.Temperatures = network.GetTemperatures(state.Disks)
+	}
+	refreshIdentity()
+	refreshSystem()
 	netMonitor.GetThroughput()
 	cpuMonitor.GetUsage()
-
-	// Initial notification state
 	state.LoggedInUsers = network.GetLoggedInUsers()
-	state.ZFSStatus = network.GetZFSStatus()
-	state.UpdateNotificationFromZFS()
 
-	displayOff := false
-
-	// Initial schedule check
-	if schedule != nil && schedule.IsNightMode() {
-		displayOff = true
-		d.Off()
-		fmt.Println("\nNight mode active - display off")
+	// Slow commands run sequentially in one worker, outside the render loop.
+	// A one-element channel coalesces results rather than queuing stale snapshots.
+	updates := make(chan storageSnapshot, 1)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			update := storageSnapshot{network.GetZFSPools(), network.GetDiskSlots(), network.GetZFSStatus()}
+			select {
+			case updates <- update:
+			case <-done:
+				return
+			}
+			select {
+			case <-ticker.C:
+			case <-done:
+				return
+			}
+		}
+	}()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	sampleTicker := time.NewTicker(time.Second)
+	defer sampleTicker.Stop()
+	slowTicker := time.NewTicker(5 * time.Second)
+	defer slowTicker.Stop()
+	identityTicker := time.NewTicker(30 * time.Second)
+	defer identityTicker.Stop()
+	scheduleTicker := time.NewTicker(time.Minute)
+	defer scheduleTicker.Stop()
+	loginTicker := time.NewTicker(10 * time.Second)
+	defer loginTicker.Stop()
+	started := time.Now()
+	page := options.PageAt(started, started, options.Pages(dashboard.PoolNames(state)))
+	interval := dashboard.RefreshInterval(state, page, options, 0)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	renderer := dashboard.NewFrameRenderer()
+	displayOff := schedule != nil && schedule.IsNightMode()
+	force := true
+	if displayOff {
+		if err := d.Off(); err != nil {
+			return err
+		}
 	} else {
 		if err := d.On(); err != nil {
-			fmt.Printf("Warning: failed to turn on display: %v\n", err)
+			return err
 		}
-		dashboard.RenderAndSend(d, img, bgImg, renderer, state)
 	}
-
-	currentAnimDuration := animDuration
-
-	for {
-		select {
-		case <-sigChan:
-			fmt.Println("\nShutting down...")
+	var lastSend time.Duration
+	var lastHealth dashboard.Health
+	render := func(now time.Time) {
+		if displayOff {
 			return
-
-		case <-scheduleTicker.C:
-			if schedule != nil {
-				shouldBeOff := schedule.IsNightMode()
-				if shouldBeOff && !displayOff {
-					displayOff = true
-					d.Off()
-					fmt.Printf("\n[%s] Night mode - display off\n", time.Now().Format("15:04"))
-				} else if !shouldBeOff && displayOff {
-					displayOff = false
-					d.On()
-					d.ClearCache()
-					fmt.Printf("\n[%s] Night mode ended - display on\n", time.Now().Format("15:04"))
+		}
+		state.ClearExpiredNotification()
+		lastHealth = dashboard.CurrentHealth(state)
+		page = options.PageAt(started, now, options.Pages(dashboard.PoolNames(state)))
+		if img, changed := renderer.Frame(state, page, options, now, force); changed {
+			stats, err := d.SendImage(img)
+			if err != nil {
+				// The device may have accepted only part of a failed frame.
+				d.ClearCache()
+				force = true
+				fmt.Fprintf(os.Stderr, "Display update failed: %v\n", err)
+				lastSend = time.Second
+			} else {
+				force = false
+				state.SetLastFrame(img)
+				// Full-page transitions are infrequent and should not permanently
+				// throttle ordinary wave updates. Partial transfers set the budget.
+				if stats.ChangedChunks > 0 && stats.ChangedChunks < stats.TotalChunks/2 {
+					lastSend = (3*lastSend + stats.SendTime) / 4
 				}
 			}
-
+		}
+		next := dashboard.RefreshInterval(state, page, options, lastSend)
+		if next != interval {
+			ticker.Reset(next)
+			interval = next
+		}
+	}
+	render(started)
+	started = time.Now() // Give the first visible page its full dwell after transfer.
+	// Alarms and page changes must not wait behind a long manual frame interval.
+	renderImportant := func() {
+		now := time.Now()
+		nextPage := options.PageAt(started, now, options.Pages(dashboard.PoolNames(state)))
+		if nextPage != page || dashboard.CurrentHealth(state) != lastHealth {
+			render(now)
+		}
+	}
+	for {
+		select {
+		case <-signals:
+			return nil
+		case <-ticker.C:
+			render(time.Now())
+		case <-state.NotificationsChanged:
+			render(time.Now())
+		case update := <-updates:
+			state.PoolReadFailed = update.pools == nil
+			if update.pools != nil {
+				state.Pools = update.pools
+			}
+			state.Disks = update.disks
+			state.ZFSReadFailed = update.zfs == nil
+			if update.zfs != nil {
+				state.ZFSStatus = update.zfs
+			}
+			if !displayOff {
+				state.Temperatures = network.GetTemperatures(state.Disks)
+			}
+			renderImportant()
 		case <-sampleTicker.C:
 			if displayOff {
 				continue
 			}
-
-			if throughput, err := netMonitor.GetThroughput(); err == nil {
+			throughput, err := netMonitor.GetThroughput()
+			state.NetworkAvailable = err == nil
+			if err == nil {
 				animator.AddSample(throughput.RxBytesPerSec, throughput.TxBytesPerSec)
-
-				state.RecentRx = append(state.RecentRx, throughput.RxBytesPerSec)
-				state.RecentTx = append(state.RecentTx, throughput.TxBytesPerSec)
-				if len(state.RecentRx) > 10 {
-					state.RecentRx = state.RecentRx[1:]
-					state.RecentTx = state.RecentTx[1:]
-				}
-
-				state.DisplayRxSpeed = dashboard.Average(state.RecentRx)
-				state.DisplayTxSpeed = dashboard.Average(state.RecentTx)
+				// A short exponential average stabilizes digits without ten seconds of lag.
+				state.DisplayRxSpeed += 0.5 * (throughput.RxBytesPerSec - state.DisplayRxSpeed)
+				state.DisplayTxSpeed += 0.5 * (throughput.TxBytesPerSec - state.DisplayTxSpeed)
+			} else {
+				state.DisplayRxSpeed = 0
+				state.DisplayTxSpeed = 0
+				animator.Reset()
 			}
-
 			state.DisplayCPU = cpuMonitor.GetUsage()
-			state.Alerts = state.CheckAlerts()
-
-			fmt.Printf("\r↓ %-12s ↑ %-12s CPU: %5.1f%%  ",
-				network.FormatBits(state.DisplayRxSpeed),
-				network.FormatBits(state.DisplayTxSpeed),
-				state.DisplayCPU)
-
-		case <-animTicker.C:
-			if displayOff {
-				continue
-			}
-			// Clear expired notifications
+			state.CPUAvailable = !math.IsNaN(state.DisplayCPU)
+			// Link state is cheap to read and must not wait for the metadata poll.
+			state.LinkState = network.GetLinkState(iface)
 			state.ClearExpiredNotification()
-			dashboard.RenderAndSend(d, img, bgImg, renderer, state)
-
+			renderImportant()
 		case <-slowTicker.C:
-			if displayOff {
-				continue
+			if !displayOff {
+				refreshSystem()
 			}
-			state.Memory = network.GetMemoryInfo()
-			state.Pools = network.GetZFSPools()
-
-			dashboard.RenderStaticLayer(bgImg, renderer, state)
-
-			if autoMode {
-				targetDuration := dashboard.CalculateAutoFPS(state)
-				if targetDuration != currentAnimDuration {
-					animTicker.Stop()
-					animTicker = time.NewTicker(targetDuration)
-					currentAnimDuration = targetDuration
-				}
+		case <-identityTicker.C:
+			if !displayOff {
+				refreshIdentity()
 			}
-
-		case <-staticTicker.C:
-			if displayOff {
-				continue
-			}
-			state.IPAddress, _ = network.GetInterfaceIP(iface)
-			state.LinkSpeed = network.GetLinkSpeed(iface)
-			state.Uptime = network.GetUptime()
-
-			dashboard.RenderStaticLayer(bgImg, renderer, state)
-
 		case <-loginTicker.C:
-			// Update logged-in users (lightweight 'who' command)
 			state.LoggedInUsers = network.GetLoggedInUsers()
-
-		case <-zfsTicker.C:
-			// Update ZFS status and notifications
-			state.ZFSStatus = network.GetZFSStatus()
-			state.UpdateNotificationFromZFS()
-			state.ClearExpiredNotification()
+		case <-scheduleTicker.C:
+			shouldBeOff := schedule != nil && schedule.IsNightMode()
+			if shouldBeOff == displayOff {
+				continue
+			}
+			if shouldBeOff {
+				if err := d.Off(); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					continue
+				}
+				displayOff = true
+				ticker.Reset(time.Minute)
+			} else {
+				if err := d.On(); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					continue
+				}
+				displayOff = false
+				force = true
+				d.ClearCache()
+				animator.Reset()
+				netMonitor = network.NewMonitor(iface)
+				cpuMonitor = network.NewCPUMonitor()
+				netMonitor.GetThroughput()
+				cpuMonitor.GetUsage()
+				state.NetworkAvailable = false
+				state.DisplayRxSpeed = 0
+				state.DisplayTxSpeed = 0
+				state.CPUAvailable = false
+				refreshIdentity()
+				refreshSystem()
+				started = time.Now()
+				interval = dashboard.RefreshInterval(state, page, options, 0)
+				ticker.Reset(interval)
+				render(time.Now())
+			}
 		}
 	}
+}
+
+type displayBenchResult struct {
+	Mode            string  `json:"mode"`
+	Frames          int     `json:"frames"`
+	WallMS          float64 `json:"wall_ms"`
+	AvgFrameMS      float64 `json:"avg_frame_ms"`
+	AvgConvertMS    float64 `json:"avg_convert_ms"`
+	AvgDiffMS       float64 `json:"avg_diff_ms"`
+	AvgSendMS       float64 `json:"avg_send_ms"`
+	ChangedChunks   int     `json:"changed_chunks"`
+	BytesWritten    int     `json:"bytes_written"`
+	SerialWrites    int     `json:"serial_writes"`
+	AvgChunksPerRun float64 `json:"avg_chunks_per_frame"`
+	AvgBytesPerRun  float64 `json:"avg_bytes_per_frame"`
+	AvgWritesPerRun float64 `json:"avg_writes_per_frame"`
+}
+
+func runDisplayBenchmark(d *display.Display, mode string, frames int, jsonOut bool) error {
+	img := display.NewDisplayImage()
+	base := display.NewDisplayImage()
+	display.FillImage(base, color.RGBA{15, 23, 42, 255})
+	display.CopyImage(img, base)
+
+	switch mode {
+	case "full":
+		d.SetCacheEnabled(false)
+	case "dirty", "noop":
+		d.SetCacheEnabled(true)
+		d.ClearCache()
+		if _, err := d.SendImage(base); err != nil {
+			return fmt.Errorf("failed to seed benchmark frame: %w", err)
+		}
+	default:
+		return fmt.Errorf("unknown bench-display mode %q (use full, dirty, noop)", mode)
+	}
+
+	var result displayBenchResult
+	result.Mode = mode
+	result.Frames = frames
+
+	start := time.Now()
+	for i := 0; i < frames; i++ {
+		switch mode {
+		case "full":
+			if i%2 == 0 {
+				display.FillImage(img, color.RGBA{15, 23, 42, 255})
+			} else {
+				display.FillImage(img, color.RGBA{16, 24, 43, 255})
+			}
+		case "dirty":
+			display.CopyImage(img, base)
+			c := color.RGBA{34, 211, 238, 255}
+			if i%2 == 1 {
+				c = color.RGBA{96, 165, 250, 255}
+			}
+			display.DrawFilledRect(img, 430, 168, 100, 40, c)
+		case "noop":
+			display.CopyImage(img, base)
+		}
+
+		stats, err := d.SendImage(img)
+		if err != nil {
+			return fmt.Errorf("frame %d failed: %w", i+1, err)
+		}
+		result.ChangedChunks += stats.ChangedChunks
+		result.BytesWritten += stats.BytesWritten
+		result.SerialWrites += stats.Writes
+		result.AvgConvertMS += durationMS(stats.ConvertTime)
+		result.AvgDiffMS += durationMS(stats.DiffTime)
+		result.AvgSendMS += durationMS(stats.SendTime)
+	}
+	result.WallMS = durationMS(time.Since(start))
+	result.AvgFrameMS = result.WallMS / float64(frames)
+	result.AvgConvertMS /= float64(frames)
+	result.AvgDiffMS /= float64(frames)
+	result.AvgSendMS /= float64(frames)
+	result.AvgChunksPerRun = float64(result.ChangedChunks) / float64(frames)
+	result.AvgBytesPerRun = float64(result.BytesWritten) / float64(frames)
+	result.AvgWritesPerRun = float64(result.SerialWrites) / float64(frames)
+
+	if jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(result)
+	}
+
+	fmt.Printf("Benchmark mode=%s frames=%d\n", result.Mode, result.Frames)
+	fmt.Printf("Wall: %.1f ms total, %.2f ms/frame\n", result.WallMS, result.AvgFrameMS)
+	fmt.Printf("CPU: convert %.2f ms/frame, diff %.2f ms/frame, send wait %.2f ms/frame\n",
+		result.AvgConvertMS, result.AvgDiffMS, result.AvgSendMS)
+	fmt.Printf("Display I/O: %.1f chunks/frame, %.0f bytes/frame, %.1f writes/frame\n",
+		result.AvgChunksPerRun, result.AvgBytesPerRun, result.AvgWritesPerRun)
+	return nil
+}
+
+func durationMS(d time.Duration) float64 {
+	return float64(d) / float64(time.Millisecond)
 }

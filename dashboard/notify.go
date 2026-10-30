@@ -7,12 +7,15 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image/png"
 	"io"
 	"net"
 	"os"
+	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultSocketPath is the Unix socket path for notification IPC
@@ -31,12 +34,32 @@ type NotifyServer struct {
 	listener net.Listener
 	state    *State
 	stopChan chan struct{}
+	clients  chan struct{}
 }
 
 // NewNotifyServer creates a new notification server
 func NewNotifyServer(state *State) (*NotifyServer, error) {
-	// Remove existing socket file if present
-	os.Remove(DefaultSocketPath)
+	// Never unlink a live instance's socket or an unrelated filesystem entry.
+	if info, err := os.Lstat(DefaultSocketPath); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("notification path is not a socket: %s", DefaultSocketPath)
+		}
+		conn, dialErr := net.DialTimeout("unix", DefaultSocketPath, 200*time.Millisecond)
+		if dialErr == nil {
+			conn.Close()
+			return nil, fmt.Errorf("display instance already running")
+		}
+		// A socket with denied access may still be live. Only connection refusal
+		// is evidence that this pathname is stale.
+		if !errors.Is(dialErr, syscall.ECONNREFUSED) {
+			return nil, fmt.Errorf("cannot verify existing socket: %w", dialErr)
+		}
+		if err := os.Remove(DefaultSocketPath); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
 
 	listener, err := net.Listen("unix", DefaultSocketPath)
 	if err != nil {
@@ -50,6 +73,7 @@ func NewNotifyServer(state *State) (*NotifyServer, error) {
 		listener: listener,
 		state:    state,
 		stopChan: make(chan struct{}),
+		clients:  make(chan struct{}, 4),
 	}, nil
 }
 
@@ -84,7 +108,12 @@ func (s *NotifyServer) listen() {
 			continue
 		}
 
-		go s.handleConnection(conn)
+		select {
+		case s.clients <- struct{}{}:
+			go func() { defer func() { <-s.clients }(); s.handleConnection(conn) }()
+		default:
+			conn.Close()
+		}
 	}
 }
 
@@ -94,20 +123,16 @@ func (s *NotifyServer) handleConnection(conn net.Conn) {
 	// Set read deadline
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReader(io.LimitReader(conn, 4097))
 	line, err := reader.ReadBytes('\n')
-	if err != nil {
-		// Try reading without newline (for simple echo commands)
-		line, _ = reader.ReadBytes(0)
-		if len(line) == 0 {
-			conn.Write([]byte(`{"error":"failed to read message"}`))
-			return
-		}
+	if len(line) > 4096 || (err != nil && err != io.EOF) || len(line) == 0 {
+		json.NewEncoder(conn).Encode(map[string]string{"error": "message must be valid JSON, at most 4096 bytes"})
+		return
 	}
 
 	var msg SocketMessage
 	if err := json.Unmarshal(line, &msg); err != nil {
-		conn.Write([]byte(fmt.Sprintf(`{"error":"invalid JSON: %s"}`, err.Error())))
+		json.NewEncoder(conn).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
 		return
 	}
 
@@ -119,13 +144,13 @@ func (s *NotifyServer) handleConnection(conn net.Conn) {
 		// Default to notify for backwards compatibility
 		s.handleNotify(conn, msg)
 	default:
-		conn.Write([]byte(fmt.Sprintf(`{"error":"unknown command: %s"}`, msg.Command)))
+		json.NewEncoder(conn).Encode(map[string]string{"error": "unknown command: " + msg.Command})
 	}
 }
 
 func (s *NotifyServer) handleNotify(conn net.Conn, msg SocketMessage) {
-	if msg.Message == "" {
-		conn.Write([]byte(`{"error":"message is required"}`))
+	if msg.Message == "" || utf8.RuneCountInString(msg.Message) > 512 || msg.Duration < 0 || msg.Duration > 86400 {
+		conn.Write([]byte(`{"error":"message must contain 1-512 characters and duration must be 0-86400 seconds"}`))
 		return
 	}
 
@@ -136,6 +161,10 @@ func (s *NotifyServer) handleNotify(conn net.Conn, msg SocketMessage) {
 		theme = ThemeWarning
 	case "danger":
 		theme = ThemeDanger
+	case "", "info":
+	default:
+		conn.Write([]byte(`{"error":"theme must be info, warning, or danger"}`))
+		return
 	}
 
 	// Create notification
@@ -150,7 +179,7 @@ func (s *NotifyServer) handleNotify(conn net.Conn, msg SocketMessage) {
 	}
 
 	// Update state
-	s.state.ActiveNotification = notif
+	s.state.SetActiveNotification(notif)
 
 	conn.Write([]byte(`{"status":"ok"}`))
 }
